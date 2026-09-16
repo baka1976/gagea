@@ -1251,7 +1251,7 @@ oracle = 제외`}></textarea>
       ${e.settings.lastSyncAt&&b`<div class="hint sm">마지막 동기화 ${new Date(e.settings.lastSyncAt).toLocaleString("ko-KR")}</div>`}
 
       <div class="setDivider">데이터</div>
-      <div class="setStat">버전 <b>v29</b> · 기록 ${e.entries.filter(d=>!d.deleted).length}건 · 분류 규칙 ${(e.categoryRules||[]).length}개 · 보낼 것 ${e.entries.filter(d=>d.dirty).length}건 · 저장 용량 ${(u/1024).toFixed(0)}KB</div>
+      <div class="setStat">버전 <b>v29d</b> · 기록 ${e.entries.filter(d=>!d.deleted).length}건 · 분류 규칙 ${(e.categoryRules||[]).length}개 · 보낼 것 ${e.entries.filter(d=>d.dirty).length}건 · 저장 용량 ${(u/1024).toFixed(0)}KB</div>
 
       <div class="acts">
         <button class="btn ghost sm" onClick=${()=>i.current&&i.current.click()}>가져오기</button>
