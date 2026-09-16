@@ -1,5 +1,5 @@
 /* 가계부 서비스워커 — 앱 셸 프리캐시 + 폰트 런타임 캐싱 */
-const VERSION = "ledger-v29c";
+const VERSION = "ledger-v29d";
 const BUILD = "v29";
 // 앱이 돌아가는 데 반드시 있어야 하는 것
 const SHELL = ["./", "./index.html", "./app.js", "./manifest.json"];
