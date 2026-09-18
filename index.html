@@ -54,7 +54,15 @@ button { cursor: pointer; }
 
 /* 검수함 */
 .inbox { background: #F7EFDC; border: 1px solid #D9BE84; border-radius: 8px; padding: 12px 13px; margin-bottom: 12px; }
-.inboxHead { display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 700; color: #7A5A17; margin-bottom: 9px; }
+.inboxHead { display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 700; color: #7A5A17; margin-bottom: 9px;
+  width: 100%; background: none; border: none; padding: 0; text-align: left; }
+.undoBar { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--ink-soft);
+  padding: 8px 12px; margin-bottom: 10px; border: 1px dashed var(--paper-line); border-radius: 8px; }
+.undoBar .btn { margin-left: auto; }
+.inboxCaret { margin-left: auto; font-size: 11px; color: #B0A48A; }
+.inbox.warn { background: #F5DDD6; border-color: #D9A08C; }
+.inbox.warn .inboxHead { color: #7A2A18; }
+.inbox.warn .inboxBulk { border-top-color: #D9A08C; color: #7A2A18; }
 .inboxItem { border-top: 1px dashed #D9BE84; padding-top: 9px; margin-top: 9px; }
 .inboxItem:first-child { border-top: none; padding-top: 0; margin-top: 0; }
 .inboxTop { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
@@ -63,7 +71,12 @@ button { cursor: pointer; }
 .inboxSub { font-size: 11.5px; color: #8A6F2E; margin: 3px 0 7px; }
 .inboxHint { font-size: 10.5px; font-weight: 500; color: #8A6F2E; margin-left: auto; }
 .inboxBulk { font-size: 12px; color: #7A5A17; line-height: 1.6; padding: 8px 0 2px; border-top: 1px dashed #D9BE84; margin-top: 8px; }
-.inboxBulk .btn { margin-top: 7px; }
+.inboxBulk .btn { margin-top: 7px; margin-right: 6px; }
+.soloTag { flex-shrink: 0; margin-left: 6px; font-size: 10.5px; padding: 2px 7px; border-radius: 9px;
+  border: 1px solid var(--paper-line); background: none; color: #B0A48A; }
+.soloTag.on { background: var(--seal); border-color: var(--seal); color: #FBF3E7; }
+.setNote { font-size: 11px; color: var(--ink-soft); font-weight: 400; margin-left: 4px; }
+.planShareOpt { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--ink-soft); margin: 2px 0 6px; }
 .inboxMore { font-size: 11.5px; color: #8A6F2E; margin-top: 9px; text-align: center; }
 
 /* 붙여넣기 */
@@ -606,7 +619,13 @@ button { cursor: pointer; }
 .planDay summary { cursor: pointer; font-size: 13px; display: flex; justify-content: space-between; gap: 8px; }
 .planSum { color: var(--ink-soft); font-size: 12px; }
 .planKinds { display: flex; flex-wrap: wrap; gap: 5px; margin: 7px 0; }
-.planItem { display: flex; gap: 7px; font-size: 12.5px; padding: 4px 0; align-items: baseline; }
+.planItem { display: flex; gap: 7px; font-size: 12.5px; padding: 4px 0; align-items: baseline;
+  width: 100%; background: none; border: none; text-align: left; color: inherit; }
+.planMark { flex-shrink: 0; width: 14px; font-size: 11px; color: #B0A48A; }
+.planItem.mk-done { color: #9A9080; }
+.planItem.mk-done .planMark { color: var(--income); }
+.planItem.mk-skip { color: var(--seal); text-decoration: line-through; text-decoration-color: var(--seal); }
+.planItem.mk-skip .planMark { color: var(--seal); text-decoration: none; }
 .planTime { flex-shrink: 0; width: 42px; color: var(--seal); font-weight: 600; font-size: 11.5px; }
 .planText { flex: 1; min-width: 0; line-height: 1.5; }
 .planCost { flex-shrink: 0; color: var(--ink-soft); font-size: 11.5px; }
