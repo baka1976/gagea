@@ -1,5 +1,5 @@
 /* 가계부 서비스워커 — 앱 셸 프리캐시 + 폰트 런타임 캐싱 */
-const VERSION = "ledger-v31";
+const VERSION = "ledger-v31-2";
 const BUILD = "v31";
 // 앱이 돌아가는 데 반드시 있어야 하는 것
 const SHELL = ["./", "./index.html", "./app.js", "./manifest.json"];
@@ -7,10 +7,18 @@ const SHELL = ["./", "./index.html", "./app.js", "./manifest.json"];
 const EXTRA = ["./icon-192.png", "./icon-512.png"];
 // xlsx.js는 명세서를 처음 넣을 때 받아서 캐시에 넣는다 (앱 첫 로딩을 무겁게 하지 않기 위해)
 
+/**
+ * 프리캐시는 반드시 브라우저 캐시를 건너뛰고 받아야 한다.
+ * 깃허브 페이지가 파일마다 10분짜리 캐시를 붙이기 때문에, 그냥 받으면
+ * '새 버전 상자에 옛 파일을 담는' 일이 벌어진다. (v31에서 실제로 겪음)
+ */
+const fresh = (u) => new Request(u, { cache: "reload" });
+
 self.addEventListener("install", (e) => {
   e.waitUntil(
     caches.open(VERSION)
-      .then((c) => c.addAll(SHELL).then(() => Promise.all(EXTRA.map((u) => c.add(u).catch(() => null)))))
+      .then((c) => c.addAll(SHELL.map(fresh))
+        .then(() => Promise.all(EXTRA.map((u) => c.add(fresh(u)).catch(() => null)))))
       .then(() => self.skipWaiting())
   );
 });
@@ -49,17 +57,22 @@ self.addEventListener("fetch", (e) => {
     return;
   }
 
-  // 앱 셸은 캐시 우선, 백그라운드로 갱신
+  /**
+   * 앱 셸은 '서버 먼저, 안 되면 캐시'.
+   * 예전에는 캐시를 먼저 내주고 뒤에서 갱신했는데, 그러면 새 파일을 올려도
+   * 그날은 옛 화면이 뜨고 다음 번에야 바뀐다. 무엇이 반영됐는지 알 수 없어
+   * 버전이 안 올라간 줄 알고 코드를 파는 일이 반복됐다.
+   * 인터넷이 없으면 캐시로 넘어가므로 오프라인에서는 그대로 돌아간다.
+   */
   e.respondWith(
-    caches.match(req).then((hit) => {
-      const net = fetch(req).then((res) => {
-        if (res && res.status === 200) {
+    fetch(req)
+      .then((res) => {
+        if (res && res.status === 200 && res.type === "basic") {
           const copy = res.clone();
           caches.open(VERSION).then((c) => c.put(req, copy));
         }
         return res;
-      }).catch(() => hit);
-      return hit || net;
-    })
+      })
+      .catch(() => caches.match(req).then((hit) => hit || caches.match("./index.html")))
   );
 });
