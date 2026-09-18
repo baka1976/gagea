@@ -1819,6 +1819,126 @@ async function ping(sheetUrl, sheetToken) {
   const res = await get(sheetUrl, { token: sheetToken, op: "ping" });
   return res;
 }
+var META_SETTINGS_SKIP = ["sheetUrl", "sheetToken", "lastSyncAt", "lastMetaSyncAt"];
+function stamp(text) {
+  let h3 = 0;
+  for (let i3 = 0; i3 < text.length; i3++) h3 = (h3 << 5) - h3 + text.charCodeAt(i3) | 0;
+  return String(h3);
+}
+function metaRowsFrom(db) {
+  const now = Date.now();
+  const sent = { ...(db.settings || {}).metaSent || {} };
+  const rows = [];
+  const push = (key, value) => {
+    const text = JSON.stringify(value);
+    const h3 = stamp(text);
+    const was = sent[key];
+    const at = was && was.h === h3 ? was.at : now;
+    sent[key] = { h: h3, at };
+    rows.push({ key, value: text, updatedAt: at });
+  };
+  const st = {};
+  for (const [k3, v3] of Object.entries(db.settings || {})) {
+    if (META_SETTINGS_SKIP.includes(k3)) continue;
+    st[k3] = v3;
+  }
+  push("settings", st);
+  push("rules", db.categoryRules || []);
+  push("accounts", db.accounts || []);
+  push("fixed", db.fixedExpenses || []);
+  for (const t4 of db.trips || []) {
+    const { plan, ...rest } = t4;
+    push(`trip:${t4.id}`, rest);
+    if (plan) {
+      const { marks, ...planRest } = plan;
+      push(`plan:${t4.id}`, planRest);
+      if (marks && Object.keys(marks).length) push(`marks:${t4.id}`, marks);
+    }
+  }
+  return { rows, sent };
+}
+function applyMeta(db, rows) {
+  if (!rows || !rows.length) return { db, changed: 0 };
+  const next = { ...db, settings: { ...db.settings }, trips: [...db.trips || []] };
+  let changed = 0;
+  const parse = (r3) => {
+    try {
+      return JSON.parse(r3.value);
+    } catch (e3) {
+      return null;
+    }
+  };
+  for (const r3 of rows) {
+    const v3 = parse(r3);
+    if (v3 == null) continue;
+    const at = Number(r3.updatedAt || 0);
+    if (r3.key === "settings") {
+      if (at <= ((next.settings.metaSent || {}).settings || {}).at) continue;
+      next.settings = {
+        ...v3,
+        sheetUrl: db.settings.sheetUrl,
+        sheetToken: db.settings.sheetToken,
+        lastSyncAt: db.settings.lastSyncAt,
+        lastMetaSyncAt: db.settings.lastMetaSyncAt,
+        metaSent: { ...db.settings.metaSent || {}, settings: { h: stamp(JSON.stringify(v3)), at } }
+      };
+      changed++;
+      continue;
+    }
+    if (r3.key === "rules") {
+      if (at <= (((next.settings.metaSent || {})["rules"] || {}).at || 0)) continue;
+      next.categoryRules = v3;
+      changed++;
+      continue;
+    }
+    if (r3.key === "accounts") {
+      if (at <= (((next.settings.metaSent || {})["accounts"] || {}).at || 0)) continue;
+      next.accounts = v3;
+      changed++;
+      continue;
+    }
+    if (r3.key === "fixed") {
+      if (at <= (((next.settings.metaSent || {})["fixed"] || {}).at || 0)) continue;
+      next.fixedExpenses = v3;
+      changed++;
+      continue;
+    }
+    const m3 = /^(trip|plan|marks):(.+)$/.exec(r3.key);
+    if (!m3) continue;
+    const [, kind, id] = m3;
+    const i3 = next.trips.findIndex((t4) => t4.id === id);
+    const cur = i3 >= 0 ? next.trips[i3] : null;
+    if (kind === "trip") {
+      if (cur && at <= (cur.updatedAt || 0)) continue;
+      const merged = { ...cur || {}, ...v3, updatedAt: at };
+      if (cur && cur.plan) merged.plan = cur.plan;
+      if (i3 >= 0) next.trips[i3] = merged;
+      else next.trips.push(merged);
+      changed++;
+      continue;
+    }
+    if (!cur) continue;
+    if (kind === "plan") {
+      if (at <= (cur.plan && cur.plan.updatedAt || 0)) continue;
+      next.trips[i3] = { ...cur, plan: { ...cur.plan || {}, ...v3, updatedAt: at } };
+      changed++;
+      continue;
+    }
+    const mine = cur.plan && cur.plan.marks || {};
+    if (at <= (cur.plan && cur.plan.marksAt || 0)) continue;
+    next.trips[i3] = { ...cur, plan: { ...cur.plan || {}, marks: { ...mine, ...v3 }, marksAt: at } };
+    changed++;
+  }
+  return { db: next, changed };
+}
+async function syncMeta(db) {
+  const { sheetUrl, sheetToken } = db.settings || {};
+  if (!sheetUrl) throw new Error("시트 주소가 없어요");
+  const { rows, sent } = metaRowsFrom(db);
+  await post(sheetUrl, { token: sheetToken, op: "metaUpsert", rows });
+  const res = await get(sheetUrl, { token: sheetToken, op: "meta", since: db.settings.lastMetaSyncAt || "" });
+  return { rows: res.meta || [], sent, serverTime: res.serverTime || (/* @__PURE__ */ new Date()).toISOString() };
+}
 
 // src/ocr.js
 var baseP = null;
@@ -2725,10 +2845,41 @@ function csvToEntries(rows, map, opts = {}) {
       // 같은 날 같은 곳에서 같은 금액을 여러 번 쓰는 일이 실제로 있다(입금·출금이 짝을 이루는 경우 포함).
       // 방향과 잔액, 같은 줄이 몇 번째인지까지 넣어야 정상 거래가 중복으로 지워지지 않는다.
       sourceHash: `${opts.accountId || ""}|${date}|${amount}|${merchant}|${cancelCell}|${direction}|${balance || ""}|${seqOf(`${date}|${amount}|${merchant}|${direction}|${balance || ""}`)}`,
+      // 실제로 일어난 일만 가리킨다. 파일·계좌·잔액·줄번호는 넣지 않는다.
+      // 같은 거래가 어느 파일에서 오든 같은 열쇠가 나와야 중복을 거를 수 있다.
+      dedupKey: `${date}|${amount}|${normKey(merchant)}|${direction}`,
       rawText: joined.trim()
     });
   }
   return { entries: out, skipped };
+}
+function dedupByCount(incoming, existing) {
+  const have = /* @__PURE__ */ new Map();
+  for (const e3 of existing || []) {
+    if (!e3 || e3.deleted) continue;
+    const k3 = e3.dedupKey;
+    if (!k3) continue;
+    have.set(k3, (have.get(k3) || 0) + 1);
+  }
+  const fresh = [], dupes = [], unsure = [];
+  const used = /* @__PURE__ */ new Map();
+  for (const x2 of incoming || []) {
+    const k3 = x2.dedupKey;
+    if (!k3) {
+      fresh.push(x2);
+      continue;
+    }
+    const n3 = (used.get(k3) || 0) + 1;
+    used.set(k3, n3);
+    const already = have.get(k3) || 0;
+    if (n3 <= already) {
+      dupes.push(x2);
+      continue;
+    }
+    if (already > 0) unsure.push(x2);
+    fresh.push(x2);
+  }
+  return { fresh, dupes, unsure };
 }
 function decodeCSVBuffer(buf) {
   const utf8 = new TextDecoder("utf-8", { fatal: false }).decode(buf);
@@ -2875,6 +3026,19 @@ function isReimbCandidate(e3, opts) {
   if ((st.excludedCounterparties || []).some((x2) => x2 && memo.includes(x2))) return false;
   return true;
 }
+var HOME_CATS = /* @__PURE__ */ new Set(["loan", "comm", "insurance", "living"]);
+function recurringKeys(entries) {
+  const out = /* @__PURE__ */ new Set();
+  for (const r3 of detectRecurring(entries || [])) if (r3.normKey) out.add(r3.normKey);
+  return out;
+}
+function isHomeSpend(e3, recurring) {
+  if (!e3) return false;
+  if (e3.fixedId) return true;
+  if (HOME_CATS.has(e3.category)) return true;
+  const k3 = e3.normKey || normKey(e3.memo);
+  return !!(recurring && k3 && recurring.has(k3));
+}
 function buildTripCost(entries, trip, opts = {}) {
   if (!trip || !trip.startDate || !trip.endDate) {
     return { ...trip || {}, inside: [], booked: [], reimb: [], onsite: 0, prepaid: 0, total: 0, welfare: 0 };
@@ -2886,6 +3050,7 @@ function buildTripCost(entries, trip, opts = {}) {
   const post2 = shift(trip.endDate, postDays);
   const reimbEnd = shift(trip.endDate, Math.max(postDays, 60));
   const inside = [], booked = [], reimb = [];
+  const homeKeys = opts.recurring || recurringKeys(entries);
   for (const e3 of entries) {
     if (e3.deleted) continue;
     if (e3.tripId && trip.id && e3.tripId !== trip.id) continue;
@@ -2894,7 +3059,9 @@ function buildTripCost(entries, trip, opts = {}) {
       continue;
     }
     if (e3.type !== "expense") continue;
-    if (e3.fixedId || e3.category === "family") continue;
+    if (e3.category === "family") continue;
+    const surelyTrip = e3.category === "travel" || e3.isOverseas || e3.currency && e3.currency !== "KRW";
+    if (!surelyTrip && isHomeSpend(e3, homeKeys)) continue;
     const welfare = e3.transferKind === "welfare";
     if (e3.transferKind && e3.transferKind !== "external" && !welfare) continue;
     const tagged = welfare ? { ...e3, welfare: true } : e3;
@@ -3299,6 +3466,8 @@ function twEntryFrom(v3, opts = {}) {
     twKind: kind,
     confidence: 0.9,
     sourceHash: `tw|${date}|${time || ""}|${krw}|${merchant}|${approval || ""}|${kind}|${index}`,
+    // 승인번호가 있으면 그 자체가 거래를 가리킨다. 없으면 날짜·금액·상대·종류로 본다.
+    dedupKey: approval ? `tw|${approval}` : `tw|${date}|${krw}|${normKey(merchant)}|${kind}`,
     rawText: joined || ""
   };
 }
@@ -3532,6 +3701,10 @@ function travelWalletToEntries(rows, opts = {}) {
       twKind: kind,
       confidence: 0.9,
       sourceHash: `tw|${date}|${String(cell(r3, col.time) || "").trim()}|${krw}|${merchant}|${String(cell(r3, col.approval) || "").trim()}|${kind}|${i3}`,
+      dedupKey: (() => {
+        const ap = String(cell(r3, col.approval) || "").trim();
+        return ap ? `tw|${ap}` : `tw|${date}|${krw}|${normKey(merchant)}|${kind}`;
+      })(),
       rawText: joined
     });
   }
@@ -4442,8 +4615,8 @@ function ImportPanel({ db, entries, onImport, onClose, flash }) {
           });
         }
         const alive = (entries || []).filter((x2) => !x2.deleted);
-        const seen = new Set(alive.map((x2) => x2.sourceHash).filter(Boolean));
-        const fresh = conv.entries.filter((x2) => !seen.has(x2.sourceHash));
+        const dd = dedupByCount(conv.entries, alive);
+        const fresh = dd.fresh;
         const rec = reconcile(fresh, alive);
         let gapMsg = "";
         if (!useCard) {
@@ -4455,7 +4628,8 @@ function ImportPanel({ db, entries, onImport, onClose, flash }) {
           map,
           rows: rows.length,
           total: conv.entries.length,
-          dupFile: conv.entries.length - fresh.length,
+          dupFile: dd.dupes.length,
+          unsure: dd.unsure,
           info,
           matched,
           useCard,
@@ -4492,6 +4666,8 @@ function ImportPanel({ db, entries, onImport, onClose, flash }) {
             </div>`}
           <div>파일에서 읽은 것 <b>${preview.total}건</b></div>
           ${preview.dupFile > 0 && html`<div>전에 넣은 것 <b>${preview.dupFile}건</b> 제외</div>`}
+          ${preview.unsure && preview.unsure.length > 0 && html`
+            <div class="gapWarn">겹치는지 애매한 것 <b>${preview.unsure.length}건</b> — 같은 날 같은 곳 같은 금액이 이미 있는데 이 파일에 더 많습니다. 넣고 나서 목록에서 확인해 주세요</div>`}
           <div>새로 넣을 것 <b>${preview.added.length}건</b></div>
           ${preview.merged.length > 0 && html`<div>이미 있는 것 <b>${preview.merged.length}건</b> 제외</div>`}
           ${preview.review.length > 0 && html`<div>확인 필요 <b>${preview.review.length}건</b></div>`}
@@ -5812,6 +5988,14 @@ function App() {
         pulled = out.pulled;
         return out.db;
       });
+      try {
+        const m3 = await syncMeta(cur);
+        setDb((prev) => {
+          const out = applyMeta(prev, m3.rows);
+          return { ...out.db, settings: { ...out.db.settings, metaSent: { ...out.db.settings.metaSent || {}, ...m3.sent }, lastMetaSyncAt: m3.serverTime } };
+        });
+      } catch (e22) {
+      }
       setSync({ state: "ok", fails: 0, msg: "" });
       if (loud) setToast(`동기화 완료 · 보냄 ${r3.pushed.length}건 · 받음 ${pulled}건`);
     } catch (e3) {
@@ -6219,8 +6403,7 @@ function App() {
     if (tsv.length > 1 && tsv.some((r3) => r3.length >= 6) && isTravelWalletTable(tsv)) {
       const tw = travelWalletToEntries(tsv, { rules: db.categoryRules, settings: db.settings });
       if (tw.entries.length) {
-        const seen = new Set(live.map((x2) => x2.sourceHash).filter(Boolean));
-        const fresh = tw.entries.filter((x2) => !seen.has(x2.sourceHash));
+        const fresh = dedupByCount(tw.entries, live).fresh;
         const rec = reconcile2(fresh, live);
         setMulti({ entries: fresh, gaps: [], ...rec, picked: rec.added.map(() => true), fromTravelWallet: tw.entries.length });
         setDraft(null);
@@ -6603,7 +6786,7 @@ function App() {
           </div>
         </div>`}
 
-      ${weird.length > 0 && html4`
+      ${tab === "month" && weird.length > 0 && html4`
         <div class="inbox warn">
           <div class="inboxHead"><${IcoAlert} size=${14} /> 금액이 이상한 기록 ${weird.length}건</div>
           <div class="inboxBulk">
@@ -6747,13 +6930,13 @@ function App() {
   }}
         onClose=${() => setPanel(null)} />`}
 
-      ${autoUndo && html4`
+      ${tab === "month" && autoUndo && html4`
         <div class="undoBar">
           방금 <b>${autoUndo.length}건</b>을 처리했어요
           <button class="btn ghost sm" onClick=${undoAutoFix}>되돌리기</button>
         </div>`}
 
-      ${inbox.length > 0 && html4`
+      ${tab === "month" && inbox.length > 0 && html4`
         <div class=${"inbox" + (inboxOpen ? " open" : "")}>
           <button class="inboxHead" onClick=${() => setInboxOpen((v3) => !v3)}>
             <${IcoInbox} size=${14} /> 확인할 항목 ${inbox.length}건
@@ -6887,6 +7070,7 @@ function ro(word) {
 function TripView({ db, live, tripId, setTripId, rowProps, patch, flash, shareText }) {
   const [planOpen, setPlanOpen] = d2(false);
   const [planShareCost, setPlanShareCost] = d2(true);
+  const [settleDetail, setSettleDetail] = d2(true);
   const [planText, setPlanText] = d2("");
   const [editCost, setEditCost] = d2(null);
   const [adding, setAdding] = d2(false);
@@ -7036,21 +7220,31 @@ function TripView({ db, live, tripId, setTripId, rowProps, patch, flash, shareTe
     }
     const catList = Object.entries(byCat).sort((a3, b3) => b3[1] - a3[1]);
     const W = (n3) => `₩${formatWon2(n3)}`;
+    const detail = items.filter((e3) => !soloIds.has(e3.id)).slice().sort((a3, b3) => a3.date < b3.date ? -1 : a3.date > b3.date ? 1 : 0);
     const settleText = [
-      `${t4.name} 정산${sm.from ? ` · ${sm.from.slice(5).replace("-", "/")} ~ ${sm.to.slice(5).replace("-", "/")}` : ""}`,
-      "",
+      `${t4.name} 정산${heads > 1 ? ` · ${heads}명` : ""}${sm.from ? ` · ${sm.from.slice(5).replace("-", "/")} ~ ${sm.to.slice(5).replace("-", "/")}` : ""}`,
+      `보내주실 돈  ${W(Math.max(0, due))}`,
+      "——————————",
       `같이 쓴 돈  ${W(shared)}`,
       ...catList.map(([k3, v3]) => `  ${(CAT_MAP2[k3] || {}).label || k3} ${W(v3)}`),
-      ...soloSum > 0 ? ["", `개인 비용 ${solo.length}건  ${W(soloSum)} (제외)`] : [],
       "",
       `${heads}명이 나눔 → 1인 ${W(perHead)}`,
       ...sm.reimbursed > 0 ? [`이미 받음  ${W(sm.reimbursed)}`] : [],
-      `보내주실 돈  ${W(Math.max(0, due))}`
+      ...settleDetail ? [
+        "",
+        "※ 카드·통장 내역에서 자동으로 뽑은 금액이라",
+        "   여행과 상관없는 게 섞였을 수 있어요.",
+        "   아래 훑어보고 이상한 것 있으면 말씀해 주세요.",
+        "",
+        "[상세]",
+        ...detail.map((e3) => `${e3.date.slice(5).replace("-", "/")}  ${e3.memo || "내역"}  ${e3.isRefund ? "-" : ""}${W(e3.amount)}`),
+        ...soloSum > 0 ? ["", `개인 비용 ${solo.length}건 ${W(soloSum)}은 뺐습니다`] : []
+      ] : []
     ].join("\n");
     return html4`
           <div class="card">
             <div class="cardLabel">
-              정산
+              <span>정산</span>
               <button class="pickToggle" onClick=${() => shareText(`${t4.name} 정산`, settleText)}>결산 보내기</button>
             </div>
             <div class="row wrap">
@@ -7064,7 +7258,7 @@ function TripView({ db, live, tripId, setTripId, rowProps, patch, flash, shareTe
       });
     }} />
               <span class="hint sm">명</span>
-              <input class="inp" placeholder="동행자 (선택)" value=${t4.members || ""}
+              <input class="inp" placeholder="동행자 이름 (안 적어도 됩니다)" value=${t4.members || ""}
                 onInput=${(ev) => {
       const v3 = ev.target.value;
       patch((d3) => {
@@ -7073,6 +7267,10 @@ function TripView({ db, live, tripId, setTripId, rowProps, patch, flash, shareTe
     }} />
             </div>
             <div class="hint sm">내가 전부 내고 나중에 나누는 방식입니다. 나 혼자 쓴 돈은 <b>항목 조정</b>에서 '개인'을 눌러 빼세요.</div>
+            <label class="planShareOpt">
+              <input type="checkbox" checked=${settleDetail} onChange=${() => setSettleDetail((v3) => !v3)} />
+              상세 내역도 함께 보내기 — 동행자가 이상한 항목을 짚어줄 수 있어요
+            </label>
             <div class="axes">
               <div class="axis"><span class="axisLabel">같이 쓴 돈</span><span class="axisVal">₩${formatWon2(shared)}</span></div>
               ${soloSum > 0 && html4`<div class="axis"><span class="axisLabel">개인 비용 ${solo.length}건</span><span class="axisVal">₩${formatWon2(soloSum)}</span></div>`}
@@ -7608,7 +7806,7 @@ function Settings({ db, setDb, onClose, flash, onSync, onUndoImport, onOpenAccou
       ${db.settings.lastSyncAt && html4`<div class="hint sm">마지막 동기화 ${new Date(db.settings.lastSyncAt).toLocaleString("ko-KR")}</div>`}
 
       <div class="setDivider">데이터</div>
-      <div class="setStat">버전 <b>v31</b> · 기록 ${db.entries.filter((e3) => !e3.deleted).length}건 · 분류 규칙 ${(db.categoryRules || []).length}개 · 보낼 것 ${db.entries.filter((e3) => e3.dirty).length}건 · 저장 용량 ${(size / 1024).toFixed(0)}KB</div>
+      <div class="setStat">버전 <b>v32</b> · 기록 ${db.entries.filter((e3) => !e3.deleted).length}건 · 분류 규칙 ${(db.categoryRules || []).length}개 · 보낼 것 ${db.entries.filter((e3) => e3.dirty).length}건 · 저장 용량 ${(size / 1024).toFixed(0)}KB</div>
 
       <div class="acts">
         <button class="btn ghost sm" onClick=${() => fileRef.current && fileRef.current.click()}>가져오기</button>
