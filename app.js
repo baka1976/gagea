@@ -2853,18 +2853,25 @@ function csvToEntries(rows, map, opts = {}) {
   }
   return { entries: out, skipped };
 }
+function entryKey(e3) {
+  if (!e3 || !e3.date || !e3.amount) return "";
+  if (e3.dedupKey) return e3.dedupKey;
+  const k3 = e3.normKey || normKey(e3.memo);
+  const dir = e3.direction || (e3.type === "income" ? "in" : "out");
+  return `${e3.date}|${e3.amount}|${k3}|${dir}`;
+}
 function dedupByCount(incoming, existing) {
   const have = /* @__PURE__ */ new Map();
   for (const e3 of existing || []) {
     if (!e3 || e3.deleted) continue;
-    const k3 = e3.dedupKey;
+    const k3 = entryKey(e3);
     if (!k3) continue;
     have.set(k3, (have.get(k3) || 0) + 1);
   }
   const fresh = [], dupes = [], unsure = [];
   const used = /* @__PURE__ */ new Map();
   for (const x2 of incoming || []) {
-    const k3 = x2.dedupKey;
+    const k3 = entryKey(x2);
     if (!k3) {
       fresh.push(x2);
       continue;
@@ -3466,8 +3473,8 @@ function twEntryFrom(v3, opts = {}) {
     twKind: kind,
     confidence: 0.9,
     sourceHash: `tw|${date}|${time || ""}|${krw}|${merchant}|${approval || ""}|${kind}|${index}`,
-    // 승인번호가 있으면 그 자체가 거래를 가리킨다. 없으면 날짜·금액·상대·종류로 본다.
-    dedupKey: approval ? `tw|${approval}` : `tw|${date}|${krw}|${normKey(merchant)}|${kind}`,
+    // 다른 명세서와 같은 모양으로 만든다. 승인번호는 시트를 돌고 오면 사라져 열쇠로 못 쓴다.
+    dedupKey: `${date}|${krw}|${normKey(merchant)}|${inflow ? "in" : "out"}`,
     rawText: joined || ""
   };
 }
@@ -3701,10 +3708,7 @@ function travelWalletToEntries(rows, opts = {}) {
       twKind: kind,
       confidence: 0.9,
       sourceHash: `tw|${date}|${String(cell(r3, col.time) || "").trim()}|${krw}|${merchant}|${String(cell(r3, col.approval) || "").trim()}|${kind}|${i3}`,
-      dedupKey: (() => {
-        const ap = String(cell(r3, col.approval) || "").trim();
-        return ap ? `tw|${ap}` : `tw|${date}|${krw}|${normKey(merchant)}|${kind}`;
-      })(),
+      dedupKey: `${date}|${krw}|${normKey(merchant)}|${inflow ? "in" : "out"}`,
       rawText: joined
     });
   }
@@ -4362,6 +4366,7 @@ function TidyPanel({ db, entries, patch, flash, onClose }) {
   const [plan, setPlan] = d2(null);
   const [undo, setUndo] = d2(null);
   const preview = () => {
+    setResult(null);
     const opts = { accounts: db.accounts, userName: db.settings.userName, settings: db.settings };
     const kinds = {};
     for (const e3 of entries) {
@@ -4488,6 +4493,7 @@ function TidyPanel({ db, entries, patch, flash, onClose }) {
       </div>
       ${plan && html`
         <div class="tidyResult">
+          <div class="tidyHead">이렇게 바뀝니다</div>
           <div>이체 성격 판정 <b>${plan.classified}건</b></div>
           <div>반쪽 이체 짝짓기 <b>${plan.pairedCount}쌍</b></div>
           ${plan.refundPairs.length > 0 && html`<div>나갔다 돌아온 돈 <b>${plan.refundPairs.length}건</b> 환불 처리</div>`}
@@ -4496,6 +4502,7 @@ function TidyPanel({ db, entries, patch, flash, onClose }) {
             <div class="gapWarn">짝 못 찾음 ${plan.halves.length}건 — 나머지 통장 내역을 먼저 넣는 게 좋습니다</div>`}
         </div>`}
       ${result ? html`<div class="tidyResult">
+            <div class="tidyHead">정리했습니다</div>
             <div>이체 성격 판정 <b>${result.classified}건</b></div>
             <div>반쪽 이체 짝짓기 <b>${result.pairedCount}쌍</b></div>
             ${result.refunds > 0 && html`<div>나갔다 돌아온 돈 <b>${result.refunds}건</b> 환불 처리</div>`}
@@ -5554,12 +5561,46 @@ var EMPTY_DB = {
     travelKeywords: ["트래블월렛", "트래블 월렛"]
   }
 };
+var ENTRY_DEFAULTS = {
+  isRefund: false,
+  tripId: null,
+  carId: null,
+  currency: "",
+  foreignAmount: null,
+  fixedId: null,
+  deleted: false,
+  dirty: false,
+  needsCheck: false,
+  isExtra: false,
+  installmentMonths: null,
+  isOverseas: false,
+  transferKind: null,
+  balanceAfter: null,
+  accountId: null,
+  status: "confirmed"
+};
+function packEntry(e3) {
+  const o3 = {};
+  for (const [k3, v3] of Object.entries(e3)) {
+    if (k3 === "dedupKey") continue;
+    if (k3 in ENTRY_DEFAULTS && v3 === ENTRY_DEFAULTS[k3]) continue;
+    o3[k3] = v3;
+  }
+  if (o3.counterpartyRaw === o3.memo) delete o3.counterpartyRaw;
+  return o3;
+}
+function unpackEntry(e3) {
+  const o3 = { ...ENTRY_DEFAULTS, ...e3 };
+  if (o3.counterpartyRaw === void 0) o3.counterpartyRaw = o3.memo;
+  return o3;
+}
 function loadDB() {
   try {
     const raw = localStorage.getItem(DB_KEY);
     if (!raw) return { ...EMPTY_DB };
     const parsed = JSON.parse(raw);
-    return { ...EMPTY_DB, ...parsed, settings: { ...EMPTY_DB.settings, ...parsed.settings || {} } };
+    const entries = (parsed.entries || []).map(unpackEntry);
+    return { ...EMPTY_DB, ...parsed, entries, settings: { ...EMPTY_DB.settings, ...parsed.settings || {} } };
   } catch (e3) {
     console.warn("저장된 데이터를 읽지 못했습니다", e3);
     return { ...EMPTY_DB };
@@ -5567,7 +5608,7 @@ function loadDB() {
 }
 function saveDB(db) {
   try {
-    const s3 = JSON.stringify(db);
+    const s3 = JSON.stringify({ ...db, entries: (db.entries || []).map(packEntry) });
     localStorage.setItem(DB_KEY, s3);
     return { ok: true, size: s3.length };
   } catch (e3) {
@@ -5973,7 +6014,11 @@ function App() {
   }, [db]);
   h2(() => {
     const r3 = saveDB(db);
-    if (!r3.ok) setToast("저장 공간이 가득 찼어요. 설정에서 내보내기 후 정리해주세요.");
+    if (!r3.ok) {
+      setToast("저장 공간이 찼어요 — 방금 것이 저장되지 않았습니다. 설정에서 백업을 받고 오래된 기록을 정리해 주세요.");
+    } else if (r3.size > 35e5) {
+      setToast("저장 공간이 거의 찼어요. 설정에서 백업을 받아두세요.");
+    }
   }, [db]);
   const runSync = q2(async (loud) => {
     const cur = dbRef.current;
@@ -7698,7 +7743,12 @@ function Settings({ db, setDb, onClose, flash, onSync, onUndoImport, onOpenAccou
       try {
         const parsed = JSON.parse(r3.result);
         if (!parsed.entries) throw new Error("형식이 다릅니다");
-        setDb({ ...EMPTY_DB, ...parsed, settings: { ...EMPTY_DB.settings, ...parsed.settings || {} } });
+        setDb({
+          ...EMPTY_DB,
+          ...parsed,
+          entries: parsed.entries.map(unpackEntry),
+          settings: { ...EMPTY_DB.settings, ...parsed.settings || {} }
+        });
         flash(`${parsed.entries.length}건을 불러왔어요`);
         onClose();
       } catch (err) {
@@ -7806,7 +7856,7 @@ function Settings({ db, setDb, onClose, flash, onSync, onUndoImport, onOpenAccou
       ${db.settings.lastSyncAt && html4`<div class="hint sm">마지막 동기화 ${new Date(db.settings.lastSyncAt).toLocaleString("ko-KR")}</div>`}
 
       <div class="setDivider">데이터</div>
-      <div class="setStat">버전 <b>v32</b> · 기록 ${db.entries.filter((e3) => !e3.deleted).length}건 · 분류 규칙 ${(db.categoryRules || []).length}개 · 보낼 것 ${db.entries.filter((e3) => e3.dirty).length}건 · 저장 용량 ${(size / 1024).toFixed(0)}KB</div>
+      <div class="setStat">버전 <b>v33</b> · 기록 ${db.entries.filter((e3) => !e3.deleted).length}건 · 분류 규칙 ${(db.categoryRules || []).length}개 · 보낼 것 ${db.entries.filter((e3) => e3.dirty).length}건 · 저장 용량 ${(size / 1024).toFixed(0)}KB</div>
 
       <div class="acts">
         <button class="btn ghost sm" onClick=${() => fileRef.current && fileRef.current.click()}>가져오기</button>

@@ -1,6 +1,6 @@
 /* 가계부 서비스워커 — 앱 셸 프리캐시 + 폰트 런타임 캐싱 */
-const VERSION = "ledger-v32";
-const BUILD = "v32";
+const VERSION = "ledger-v33";
+const BUILD = "v33";
 // 앱이 돌아가는 데 반드시 있어야 하는 것
 const SHELL = ["./", "./index.html", "./app.js", "./manifest.json"];
 // 없어도 앱은 돌아가는 것 (아이콘이 빠졌다고 서비스워커 설치 전체가 실패하면 안 된다)
