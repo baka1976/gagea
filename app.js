@@ -1621,6 +1621,8 @@ var SOURCE_RANK = { statement: 4, sms: 3, shortcut: 3, receipt: 2, capture: 2, m
 function matchScore(a3, b3) {
   if (a3.amount !== b3.amount) return 0;
   if (a3.type !== b3.type) return 0;
+  if (a3.direction && b3.direction && a3.direction !== b3.direction) return 0;
+  if (a3.accountId && b3.accountId && a3.accountId !== b3.accountId) return 0;
   const da = /* @__PURE__ */ new Date(a3.date + "T00:00:00"), db = /* @__PURE__ */ new Date(b3.date + "T00:00:00");
   const dayDiff2 = Math.abs((da - db) / 864e5);
   if (dayDiff2 > 3) return 0;
@@ -1819,7 +1821,16 @@ async function ping(sheetUrl, sheetToken) {
   const res = await get(sheetUrl, { token: sheetToken, op: "ping" });
   return res;
 }
-var META_SETTINGS_SKIP = ["sheetUrl", "sheetToken", "lastSyncAt", "lastMetaSyncAt"];
+var META_SETTINGS_SKIP = ["sheetUrl", "sheetToken", "lastSyncAt", "lastMetaSyncAt", "metaSent"];
+function settingsForMeta(settings) {
+  const st = {};
+  for (const [k3, v3] of Object.entries(settings || {})) {
+    if (META_SETTINGS_SKIP.includes(k3)) continue;
+    st[k3] = v3;
+  }
+  return st;
+}
+var GUARDED = ["settings", "rules", "accounts", "fixed"];
 function stamp(text) {
   let h3 = 0;
   for (let i3 = 0; i3 < text.length; i3++) h3 = (h3 << 5) - h3 + text.charCodeAt(i3) | 0;
@@ -1828,21 +1839,18 @@ function stamp(text) {
 function metaRowsFrom(db) {
   const now = Date.now();
   const sent = { ...(db.settings || {}).metaSent || {} };
+  if (!sent.__v35) for (const k3 of GUARDED) delete sent[k3];
+  sent.__v35 = true;
   const rows = [];
   const push = (key, value) => {
     const text = JSON.stringify(value);
     const h3 = stamp(text);
     const was = sent[key];
-    const at = was && was.h === h3 ? was.at : now;
+    const at = !was && GUARDED.includes(key) ? 0 : was && was.h === h3 ? was.at : now;
     sent[key] = { h: h3, at };
     rows.push({ key, value: text, updatedAt: at });
   };
-  const st = {};
-  for (const [k3, v3] of Object.entries(db.settings || {})) {
-    if (META_SETTINGS_SKIP.includes(k3)) continue;
-    st[k3] = v3;
-  }
-  push("settings", st);
+  push("settings", settingsForMeta(db.settings));
   push("rules", db.categoryRules || []);
   push("accounts", db.accounts || []);
   push("fixed", db.fixedExpenses || []);
@@ -1861,6 +1869,7 @@ function applyMeta(db, rows) {
   if (!rows || !rows.length) return { db, changed: 0 };
   const next = { ...db, settings: { ...db.settings }, trips: [...db.trips || []] };
   let changed = 0;
+  const sent = {};
   const parse = (r3) => {
     try {
       return JSON.parse(r3.value);
@@ -1872,34 +1881,28 @@ function applyMeta(db, rows) {
     const v3 = parse(r3);
     if (v3 == null) continue;
     const at = Number(r3.updatedAt || 0);
+    const mineAt = (k3) => ((db.settings.metaSent || {})[k3] || {}).at || 0;
     if (r3.key === "settings") {
-      if (at <= ((next.settings.metaSent || {}).settings || {}).at) continue;
+      if (at <= mineAt("settings")) continue;
+      const clean = settingsForMeta(v3);
       next.settings = {
-        ...v3,
+        ...clean,
         sheetUrl: db.settings.sheetUrl,
         sheetToken: db.settings.sheetToken,
         lastSyncAt: db.settings.lastSyncAt,
         lastMetaSyncAt: db.settings.lastMetaSyncAt,
-        metaSent: { ...db.settings.metaSent || {}, settings: { h: stamp(JSON.stringify(v3)), at } }
+        metaSent: db.settings.metaSent
       };
+      sent.settings = { h: stamp(JSON.stringify(clean)), at };
       changed++;
       continue;
     }
-    if (r3.key === "rules") {
-      if (at <= (((next.settings.metaSent || {})["rules"] || {}).at || 0)) continue;
-      next.categoryRules = v3;
-      changed++;
-      continue;
-    }
-    if (r3.key === "accounts") {
-      if (at <= (((next.settings.metaSent || {})["accounts"] || {}).at || 0)) continue;
-      next.accounts = v3;
-      changed++;
-      continue;
-    }
-    if (r3.key === "fixed") {
-      if (at <= (((next.settings.metaSent || {})["fixed"] || {}).at || 0)) continue;
-      next.fixedExpenses = v3;
+    if (r3.key === "rules" || r3.key === "accounts" || r3.key === "fixed") {
+      if (at <= mineAt(r3.key)) continue;
+      if (r3.key === "rules") next.categoryRules = v3;
+      else if (r3.key === "accounts") next.accounts = v3;
+      else next.fixedExpenses = v3;
+      sent[r3.key] = { h: stamp(JSON.stringify(v3)), at };
       changed++;
       continue;
     }
@@ -1929,7 +1932,7 @@ function applyMeta(db, rows) {
     next.trips[i3] = { ...cur, plan: { ...cur.plan || {}, marks: { ...mine, ...v3 }, marksAt: at } };
     changed++;
   }
-  return { db: next, changed };
+  return { db: next, changed, sent };
 }
 async function syncMeta(db) {
   const { sheetUrl, sheetToken } = db.settings || {};
@@ -2894,6 +2897,46 @@ function dedupByCount(incoming, existing) {
     fresh.push(x2);
   }
   return { fresh, dupes, unsure };
+}
+function checkFile(rows, entries) {
+  const list = entries || [];
+  const withBal = list.filter((e3) => e3.balanceAfter != null && e3.balanceAfter !== "" && !Number.isNaN(Number(e3.balanceAfter)));
+  let outSum = 0, inSum = 0;
+  for (const e3 of list) {
+    const v3 = e3.isRefund && e3.direction !== "in" ? -e3.amount : e3.amount;
+    if (e3.direction === "in") inSum += e3.amount;
+    else outSum += v3;
+  }
+  const res = { outSum, inSum, totals: null, chain: null };
+  for (const r3 of rows || []) {
+    const joined = (r3 || []).join(" ");
+    if (!/합\s*계|총\s*합|총\s*계/.test(joined)) continue;
+    const nums = (joined.match(/-?\d{1,3}(?:,\d{3})+|-?\d{4,}/g) || []).map((t4) => Number(t4.replace(/,/g, ""))).filter((n3) => Math.abs(n3) >= 1 && Math.abs(n3) < 1e10);
+    if (!nums.length) continue;
+    const has = (x2) => nums.some((n3) => Math.abs(n3) === Math.abs(x2));
+    let ok;
+    if (inSum > 0 && outSum > 0) ok = has(outSum) && has(inSum);
+    else ok = has(outSum + inSum);
+    const near = nums.slice().sort((a3, b3) => Math.abs(Math.abs(a3) - (outSum || inSum)) - Math.abs(Math.abs(b3) - (outSum || inSum)))[0];
+    res.totals = { ok, fileNums: nums, diff: ok ? 0 : Math.abs(Math.abs(near) - (outSum || inSum)) };
+    break;
+  }
+  res.huge = list.filter((e3) => e3.amount >= 1e9).length;
+  if (withBal.length >= 2 && withBal.length * 2 > list.length) {
+    const desc = withBal[0].date >= withBal[withBal.length - 1].date;
+    const delta = (e3) => e3.direction === "in" ? e3.amount : -e3.amount;
+    let breaks = 0, first = null;
+    for (let i3 = 1; i3 < withBal.length; i3++) {
+      const later = desc ? withBal[i3 - 1] : withBal[i3];
+      const earlier = desc ? withBal[i3] : withBal[i3 - 1];
+      if (Number(earlier.balanceAfter) + delta(later) !== Number(later.balanceAfter)) {
+        breaks++;
+        if (!first) first = later.date;
+      }
+    }
+    res.chain = { pairs: withBal.length - 1, breaks, first, noBal: list.length - withBal.length };
+  }
+  return res;
 }
 function decodeCSVBuffer(buf) {
   const utf8 = new TextDecoder("utf-8", { fatal: false }).decode(buf);
@@ -4631,7 +4674,8 @@ function ImportPanel({ db, entries, onImport, onClose, flash }) {
         const alive = (entries || []).filter((x2) => !x2.deleted);
         const dd = dedupByCount(conv.entries, alive);
         const fresh = dd.fresh;
-        const rec = reconcile(fresh, alive);
+        const rec = reconcile(fresh, alive.filter((x2) => x2.source !== "statement"));
+        const check = checkFile(rows, conv.entries);
         let gapMsg = "";
         if (!useCard) {
           const all = [...alive, ...fresh].filter((x2) => x2.accountId === useAcct);
@@ -4648,6 +4692,7 @@ function ImportPanel({ db, entries, onImport, onClose, flash }) {
           matched,
           useCard,
           gapMsg,
+          check,
           ...rec
         });
       } catch (err) {
@@ -4679,12 +4724,13 @@ function ImportPanel({ db, entries, onImport, onClose, flash }) {
               ${preview.matched ? ` · ${preview.matched.name}` : ""}
             </div>`}
           <div>파일에서 읽은 것 <b>${preview.total}건</b></div>
+          ${preview.check && html`<${FileCheck} c=${preview.check} />`}
           ${preview.dupFile > 0 && html`<div>전에 넣은 것 <b>${preview.dupFile}건</b> 제외</div>`}
           ${preview.unsure && preview.unsure.length > 0 && html`
             <div class="gapWarn">겹치는지 애매한 것 <b>${preview.unsure.length}건</b> — 같은 날 같은 곳 같은 금액이 이미 있는데 이 파일에 더 많습니다. 넣고 나서 목록에서 확인해 주세요</div>`}
           <div>새로 넣을 것 <b>${preview.added.length}건</b></div>
           ${preview.merged.length > 0 && html`<div>이미 있는 것 <b>${preview.merged.length}건</b> 제외</div>`}
-          ${preview.review.length > 0 && html`<div>확인 필요 <b>${preview.review.length}건</b></div>`}
+          ${preview.review.length > 0 && html`<div>확인 필요 <b>${preview.review.length}건</b> — 함께 넣고 '확인할 항목'에 올려 둡니다</div>`}
           ${preview.gapMsg && html`<div class="gapWarn">${preview.gapMsg}</div>`}
         </div>`}
 
@@ -4693,11 +4739,25 @@ function ImportPanel({ db, entries, onImport, onClose, flash }) {
         <button class="btn ghost sm" onClick=${onClose}>닫기</button>
         <button class="btn ghost sm" onClick=${() => fileRef.current && fileRef.current.click()}>파일 고르기</button>
         ${preview && html`<button class="btn primary sm" onClick=${() => {
-    onImport(preview.added, fileName);
+    const doubt = preview.review.map((r3) => ({ ...r3.incoming, status: "pending", needsCheck: true }));
+    onImport([...preview.added, ...doubt], fileName);
     setPreview(null);
-  }}>${preview.added.length}건 넣기</button>`}
+  }}>${preview.added.length + preview.review.length}건 넣기</button>`}
       </div>
     </div>`;
+}
+function FileCheck({ c: c3 }) {
+  const W = (n3) => `₩${formatWon(n3)}`;
+  const lines = [];
+  if (c3.totals) {
+    lines.push(c3.totals.ok ? html`<div class="chkOk">✓ 파일 합계와 일치 (출금 ${W(c3.outSum)} · 입금 ${W(c3.inSum)})</div>` : html`<div class="gapWarn">파일 합계와 <b>${W(c3.totals.diff)}</b> 차이 — 못 읽은 줄이 있어요</div>`);
+  }
+  if (c3.chain) {
+    lines.push(c3.chain.breaks === 0 && !c3.chain.noBal ? html`<div class="chkOk">✓ 거래 후 잔액이 처음부터 끝까지 이어져요</div>` : html`<div class="gapWarn">잔액이 <b>${c3.chain.breaks}곳</b>에서 끊겨요${c3.chain.first ? ` (처음 ${c3.chain.first.slice(5).replace("-", "/")} 부근)` : ""}${c3.chain.noBal ? ` · 잔액을 못 읽은 줄 ${c3.chain.noBal}개` : ""} — 빠진 줄이 있거나 금액을 잘못 읽었을 수 있어요. 은행에서 받은 원본 파일인지 확인해 주세요</div>`);
+  }
+  if (c3.huge) lines.push(html`<div class="gapWarn">10억이 넘는 금액이 <b>${c3.huge}건</b> — 금액 칸에 계좌번호가 들어간 것 같아요</div>`);
+  if (!lines.length) lines.push(html`<div class="hint sm">이 파일엔 대조할 합계·잔액이 없어 읽은 건수만 알려드려요</div>`);
+  return html`<div class="fileCheck">${lines}</div>`;
 }
 function TripPicker({ trip, picked, toggle }) {
   const line = (e3, tag) => html`
@@ -5568,6 +5628,36 @@ var EMPTY_DB = {
     travelKeywords: ["트래블월렛", "트래블 월렛"]
   }
 };
+function restoreSettingsFrom(d3, backup) {
+  if (!backup || typeof backup !== "object" || !backup.settings) throw new Error("형식이 다릅니다");
+  const keep = ["sheetUrl", "sheetToken", "lastSyncAt", "lastMetaSyncAt", "metaSent"];
+  const st = { ...EMPTY_DB.settings, ...d3.settings };
+  for (const [k3, v3] of Object.entries(backup.settings)) if (!keep.includes(k3)) st[k3] = v3;
+  const sent = { ...d3.settings.metaSent || {} };
+  for (const k3 of ["settings", "rules", "accounts", "fixed"]) sent[k3] = { h: "", at: 0 };
+  sent.__v35 = true;
+  st.metaSent = sent;
+  const pick = (k3) => Array.isArray(backup[k3]) ? backup[k3] : d3[k3] || [];
+  const next = {
+    ...d3,
+    settings: st,
+    categoryRules: pick("categoryRules"),
+    accounts: pick("accounts"),
+    fixedExpenses: pick("fixedExpenses"),
+    vehicles: pick("vehicles"),
+    maintenance: pick("maintenance"),
+    mileageLogs: pick("mileageLogs"),
+    favorites: pick("favorites")
+  };
+  const trips = [...d3.trips || []];
+  for (const t4 of backup.trips || []) if (t4 && t4.id && !trips.some((x2) => x2.id === t4.id)) trips.push(t4);
+  next.trips = trips;
+  const summary = `분류 규칙 ${next.categoryRules.length}개, 계좌 ${next.accounts.length}개, 고정비 ${next.fixedExpenses.length}개, 여행 ${trips.length}개와 설정을 되살립니다.`;
+  return { db: next, summary };
+}
+function wipeEntries(d3) {
+  return { ...EMPTY_DB, ...d3, entries: [], imports: [], settings: { ...EMPTY_DB.settings, ...d3.settings || {}, lastSyncAt: "" } };
+}
 var ENTRY_DEFAULTS = {
   isRefund: false,
   tripId: null,
@@ -6043,8 +6133,9 @@ function App() {
       try {
         const m3 = await syncMeta(cur);
         setDb((prev) => {
-          const out = applyMeta(prev, m3.rows);
-          return { ...out.db, settings: { ...out.db.settings, metaSent: { ...out.db.settings.metaSent || {}, ...m3.sent }, lastMetaSyncAt: m3.serverTime } };
+          const base2 = { ...prev, settings: { ...prev.settings, metaSent: { ...prev.settings.metaSent || {}, ...m3.sent } } };
+          const out = applyMeta(base2, m3.rows);
+          return { ...out.db, settings: { ...out.db.settings, metaSent: { ...out.db.settings.metaSent || {}, ...m3.sent, ...out.sent || {} }, lastMetaSyncAt: m3.serverTime } };
         });
       } catch (e22) {
       }
@@ -7742,6 +7833,27 @@ function Settings({ db, setDb, onClose, flash, onSync, onUndoImport, onOpenAccou
     document.body.removeChild(a3);
     setTimeout(() => URL.revokeObjectURL(url), 1e3);
   };
+  const setRef = A2(null);
+  const importSettingsOnly = (e3) => {
+    const f3 = e3.target.files && e3.target.files[0];
+    if (!f3) return;
+    const r3 = new FileReader();
+    r3.onload = () => {
+      try {
+        const parsed = JSON.parse(r3.result);
+        const out = restoreSettingsFrom(db, parsed);
+        if (!window.confirm(`${out.summary}
+거래 기록은 건드리지 않아요. 되살릴까요?`)) return;
+        setDb(out.db);
+        flash("설정을 되살렸어요 · 다음 동기화 때 시트에도 올라가요");
+        onClose();
+      } catch (err) {
+        flash("백업 파일을 읽지 못했어요");
+      }
+      e3.target.value = "";
+    };
+    r3.readAsText(f3);
+  };
   const importJSON = (e3) => {
     const f3 = e3.target.files && e3.target.files[0];
     if (!f3) return;
@@ -7863,13 +7975,18 @@ function Settings({ db, setDb, onClose, flash, onSync, onUndoImport, onOpenAccou
       ${db.settings.lastSyncAt && html4`<div class="hint sm">마지막 동기화 ${new Date(db.settings.lastSyncAt).toLocaleString("ko-KR")}</div>`}
 
       <div class="setDivider">데이터</div>
-      <div class="setStat">버전 <b>v34</b> · 기록 ${db.entries.filter((e3) => !e3.deleted).length}건 · 분류 규칙 ${(db.categoryRules || []).length}개 · 보낼 것 ${db.entries.filter((e3) => e3.dirty).length}건 · 저장 용량 ${(size / 1024).toFixed(0)}KB</div>
+      <div class="setStat">버전 <b>v35</b> · 기록 ${db.entries.filter((e3) => !e3.deleted).length}건 · 분류 규칙 ${(db.categoryRules || []).length}개 · 보낼 것 ${db.entries.filter((e3) => e3.dirty).length}건 · 저장 용량 ${(size / 1024).toFixed(0)}KB</div>
 
       <div class="acts">
         <button class="btn ghost sm" onClick=${() => fileRef.current && fileRef.current.click()}>가져오기</button>
         <button class="btn primary sm" onClick=${exportJSON}>백업 내보내기</button>
       </div>
       <input ref=${fileRef} type="file" accept="application/json" style="display:none" onChange=${importJSON} />
+      <div class="hint sm">설정·분류 규칙·계좌만 날아갔다면 <b>설정만 되살리기</b>를 쓰세요. 백업 파일에서 거래 기록은 빼고 나머지만 가져옵니다.</div>
+      <div class="acts">
+        <button class="btn ghost sm" onClick=${() => setRef.current && setRef.current.click()}>설정만 되살리기</button>
+      </div>
+      <input ref=${setRef} type="file" accept="application/json" style="display:none" onChange=${importSettingsOnly} />
 
       <div class="setDivider danger">기록 지우기</div>
       <div class="hint sm">
@@ -7878,7 +7995,7 @@ function Settings({ db, setDb, onClose, flash, onSync, onUndoImport, onOpenAccou
       </div>
       ${confirm1 ? html4`
           <div class="dangerBox">
-            <div>기록 ${db.entries.filter((e3) => !e3.deleted).length}건, 여행 ${db.trips.length}건, 고정비 ${db.fixedExpenses.length}건이 사라집니다.</div>
+            <div>거래 기록 ${db.entries.filter((e3) => !e3.deleted).length}건이 사라집니다. 설정·분류 규칙·계좌·여행·고정비는 그대로 남아요.</div>
             <div class="dangerNote">
               구글시트를 쓰신다면 <b>시트의 entries 탭도 함께 비우셔야</b> 합니다.
               안 그러면 다음 동기화 때 되살아납니다.
@@ -7886,11 +8003,7 @@ function Settings({ db, setDb, onClose, flash, onSync, onUndoImport, onOpenAccou
             <div class="acts">
               <button class="btn ghost sm" onClick=${() => setConfirm1(false)}>그만두기</button>
               <button class="btn danger sm" onClick=${() => {
-    setDb((d3) => ({
-      ...EMPTY_DB,
-      categoryRules: d3.categoryRules || [],
-      settings: { ...d3.settings, lastSyncAt: "" }
-    }));
+    setDb((d3) => wipeEntries(d3));
     setConfirm1(false);
     flash("기록을 지웠어요");
     onClose();
@@ -8000,7 +8113,7 @@ function Root() {
     if (!window.confirm("기록을 모두 지웁니다. 백업을 먼저 받으셨나요?")) return;
     try {
       const cur = JSON.parse(localStorage.getItem(DB_KEY) || "{}");
-      localStorage.setItem(DB_KEY, JSON.stringify({ ...EMPTY_DB, categoryRules: cur.categoryRules || [], settings: { ...EMPTY_DB.settings, ...cur.settings || {}, lastSyncAt: "" } }));
+      localStorage.setItem(DB_KEY, JSON.stringify(wipeEntries({ ...EMPTY_DB, ...cur, settings: { ...EMPTY_DB.settings, ...cur.settings || {} } })));
     } catch (e3) {
       localStorage.removeItem(DB_KEY);
     }
@@ -8035,3 +8148,7 @@ function Root() {
     </div>`;
 }
 R(html4`<${Root} />`, document.getElementById("root"));
+export {
+  restoreSettingsFrom,
+  wipeEntries
+};
