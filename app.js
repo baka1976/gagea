@@ -2860,13 +2860,19 @@ function entryKey(e3) {
   const dir = e3.direction || (e3.type === "income" ? "in" : "out");
   return `${e3.date}|${e3.amount}|${k3}|${dir}`;
 }
+function sameAccount(a3, b3) {
+  const x2 = a3 && a3.accountId, y3 = b3 && b3.accountId;
+  if (!x2 || !y3) return true;
+  return x2 === y3;
+}
 function dedupByCount(incoming, existing) {
   const have = /* @__PURE__ */ new Map();
   for (const e3 of existing || []) {
     if (!e3 || e3.deleted) continue;
     const k3 = entryKey(e3);
     if (!k3) continue;
-    have.set(k3, (have.get(k3) || 0) + 1);
+    if (!have.has(k3)) have.set(k3, []);
+    have.get(k3).push(e3);
   }
   const fresh = [], dupes = [], unsure = [];
   const used = /* @__PURE__ */ new Map();
@@ -2876,9 +2882,10 @@ function dedupByCount(incoming, existing) {
       fresh.push(x2);
       continue;
     }
-    const n3 = (used.get(k3) || 0) + 1;
-    used.set(k3, n3);
-    const already = have.get(k3) || 0;
+    const pool = (have.get(k3) || []).filter((e3) => sameAccount(e3, x2));
+    const n3 = (used.get(k3 + "|" + (x2.accountId || "")) || 0) + 1;
+    used.set(k3 + "|" + (x2.accountId || ""), n3);
+    const already = pool.length;
     if (n3 <= already) {
       dupes.push(x2);
       continue;
@@ -7856,7 +7863,7 @@ function Settings({ db, setDb, onClose, flash, onSync, onUndoImport, onOpenAccou
       ${db.settings.lastSyncAt && html4`<div class="hint sm">마지막 동기화 ${new Date(db.settings.lastSyncAt).toLocaleString("ko-KR")}</div>`}
 
       <div class="setDivider">데이터</div>
-      <div class="setStat">버전 <b>v33</b> · 기록 ${db.entries.filter((e3) => !e3.deleted).length}건 · 분류 규칙 ${(db.categoryRules || []).length}개 · 보낼 것 ${db.entries.filter((e3) => e3.dirty).length}건 · 저장 용량 ${(size / 1024).toFixed(0)}KB</div>
+      <div class="setStat">버전 <b>v34</b> · 기록 ${db.entries.filter((e3) => !e3.deleted).length}건 · 분류 규칙 ${(db.categoryRules || []).length}개 · 보낼 것 ${db.entries.filter((e3) => e3.dirty).length}건 · 저장 용량 ${(size / 1024).toFixed(0)}KB</div>
 
       <div class="acts">
         <button class="btn ghost sm" onClick=${() => fileRef.current && fileRef.current.click()}>가져오기</button>
