@@ -1125,8 +1125,8 @@ function matchRule(key, rules) {
 }
 function wordHit(text, low, w3) {
   if (/^[A-Za-z0-9+]{1,3}$/.test(w3)) {
-    const esc = w3.replace(/[+]/g, "\\+");
-    return new RegExp(`(^|[^A-Za-z])${esc}([^A-Za-z]|$)`, "i").test(text);
+    const esc2 = w3.replace(/[+]/g, "\\+");
+    return new RegExp(`(^|[^A-Za-z])${esc2}([^A-Za-z]|$)`, "i").test(text);
   }
   return text.includes(w3) || low.includes(w3.toLowerCase());
 }
@@ -2606,6 +2606,7 @@ function groupForReview(entries, opts = {}) {
   for (const e3 of entries) {
     if (e3.deleted || e3.type !== "expense") continue;
     if (opts.onlyPending && e3.status !== "pending") continue;
+    if (e3.transferKind && e3.transferKind !== "external" && e3.transferKind !== "welfare") continue;
     const k3 = e3.normKey || normKey(e3.memo) || "__none";
     if (!groups.has(k3)) groups.set(k3, []);
     groups.get(k3).push(e3);
@@ -2740,6 +2741,7 @@ function isPayLike(name) {
   const n3 = String(name || "").replace(/\s+/g, "").toLowerCase();
   return PAY_WORDS.some((w3) => n3.includes(w3.toLowerCase()));
 }
+var CHANNEL_KIND = /^(스마트폰뱅킹|스마트뱅킹|인터넷뱅킹|인터넷|모바일|모바일뱅킹|폰뱅킹|텔레뱅킹|창구|자동화기기|atm|cd|오픈뱅킹|오픈인증|타행이체|타행건별|전자금융|대체|대체입금|대체출금|펌뱅킹|자동이체|이체)$/i;
 function csvToEntries(rows, map, opts = {}) {
   const seqCount = /* @__PURE__ */ new Map();
   const seqOf = (key) => {
@@ -2786,7 +2788,8 @@ function csvToEntries(rows, map, opts = {}) {
       if (k3) merchant = k3;
     }
     const kindCell = (map.colKind >= 0 ? String(r3[map.colKind] || "") : "").trim();
-    const forCat = kindCell && kindCell !== merchant ? `${kindCell} ${merchant}` : merchant;
+    const kindUse = CHANNEL_KIND.test(kindCell.replace(/\s+/g, "")) ? "" : kindCell;
+    const forCat = kindUse && kindUse !== merchant ? `${kindUse} ${merchant}` : merchant;
     const balance = map.colBalance >= 0 ? num(r3[map.colBalance]) : null;
     const cancelCell = map.colCancel >= 0 ? String(r3[map.colCancel] || "") : "";
     const instCell = map.colInstallment >= 0 ? String(r3[map.colInstallment] || "") : "";
@@ -2937,6 +2940,23 @@ function checkFile(rows, entries) {
     res.chain = { pairs: withBal.length - 1, breaks, first, noBal: list.length - withBal.length };
   }
   return res;
+}
+function fxTopupTwins(entries, settings = {}) {
+  const kws = (settings.travelKeywords && settings.travelKeywords.length ? settings.travelKeywords : ["트래블월렛", "트래블 월렛"]).map((k3) => String(k3).replace(/\s+/g, "")).filter(Boolean);
+  const live = (entries || []).filter((e3) => !e3.deleted);
+  const charges = live.filter((e3) => e3.transferKind === "fxTopup" && e3.paymentMethod === "travelwallet");
+  if (!charges.length) return [];
+  const bankSide = live.filter((e3) => e3.type === "expense" && !e3.transferKind && e3.direction !== "in" && e3.paymentMethod !== "travelwallet" && e3.catBy !== "user" && kws.some((k3) => String(e3.memo || "").replace(/\s+/g, "").includes(k3)));
+  const dayDiff2 = (a3, b3) => Math.abs(/* @__PURE__ */ new Date(`${a3}T00:00:00`) - /* @__PURE__ */ new Date(`${b3}T00:00:00`)) / DAY;
+  const used = /* @__PURE__ */ new Set(), out = [];
+  for (const b3 of bankSide) {
+    const c3 = charges.find((x2) => !used.has(x2.id) && x2.amount === b3.amount && dayDiff2(x2.date, b3.date) <= 1);
+    if (c3) {
+      used.add(c3.id);
+      out.push(b3.id);
+    }
+  }
+  return out;
 }
 function decodeCSVBuffer(buf) {
   const utf8 = new TextDecoder("utf-8", { fatal: false }).decode(buf);
@@ -4105,12 +4125,12 @@ function parseItinerary(src, opts = {}) {
     const d3 = line.match(DAY_RE);
     if (d3) {
       const no = parseInt(d3[1] || d3[2], 10);
-      const md = line.match(MD_RE);
+      const md2 = line.match(MD_RE);
       cur = {
         dayNo: no,
         date: "",
-        month: md ? +md[1] : null,
-        day: md ? +md[2] : null,
+        month: md2 ? +md2[1] : null,
+        day: md2 ? +md2[2] : null,
         title: line.replace(/\s+/g, " ").trim(),
         items: []
       };
@@ -4139,31 +4159,310 @@ function parseItinerary(src, opts = {}) {
   }
   return { days, parsed: days.length > 0, raw: String(src || "") };
 }
-function itemKey(dayNo, it) {
-  const t4 = String(it && it.text || "").replace(/\s+/g, "").slice(0, 20);
-  return `${dayNo}|${it && it.time || ""}|${t4}`;
+var DAY_HEAD = /^\s*(?:(\d{1,2})\s*일\s*차|Day\s*(\d{1,2}))/i;
+var ROW_TIME = /^\s*(\d{1,2}:\d{2})\s*(?:[~\-–]\s*(\d{1,2}:\d{2})?)?\s*$/;
+var esc = (s3) => String(s3 == null ? "" : s3).replace(/[&<>"']/g, (c3) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c3]);
+var decodeEnt = (s3) => s3.replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&#(\d+);/g, (_2, n3) => String.fromCharCode(+n3));
+function cellText(inner) {
+  let s3 = inner.replace(/<br\s*\/?>/gi, "\n").replace(/<\/(p|div|li|h\d|ul|ol)>/gi, "\n").replace(/<(ul|ol)[^>]*>/gi, "\n").replace(/<li[^>]*>/gi, "\n- ");
+  s3 = decodeEnt(s3.replace(/<[^>]+>/g, " "));
+  return s3.split("\n").map((l3) => l3.replace(/[ \t]+/g, " ").trim()).filter(Boolean).join("\n");
 }
-function planCost(days, marks) {
+function htmlToTabbed(src) {
+  let s3 = String(src || "").replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<style[\s\S]*?<\/style>/gi, " ").replace(/<head[\s\S]*?<\/head>/gi, " ");
+  s3 = s3.replace(/<tr[^>]*>([\s\S]*?)<\/tr>/gi, (_2, row) => {
+    const cells = [];
+    row.replace(/<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/gi, (__, inner) => {
+      cells.push(cellText(inner));
+      return "";
+    });
+    return `
+${cells.map((c3) => c3.replace(/\n/g, "\u2028")).join("	")}
+`;
+  });
+  s3 = s3.replace(/<\/(div|p|h1|h2|h3|h4|li|section|table|thead|tbody|header)>/gi, "\n").replace(/<br\s*\/?>/gi, "\n");
+  s3 = decodeEnt(s3.replace(/<[^>]+>/g, " "));
+  const out = [];
+  for (const part of s3.split(/(\u0001[\s\S]*?\u0002)/)) {
+    if (part.startsWith("")) out.push(part.slice(1, -1));
+    else for (const l3 of part.split("\n")) {
+      const t4 = l3.replace(/[ \t]+/g, " ").trim();
+      if (t4) out.push(t4);
+    }
+  }
+  return out.join("\n");
+}
+var CHOICE_RE = /택\s*1|선택\s*1|\[\s*선택|①|또는/;
+function costAll(text, yenRate = 9.2, choice = false) {
+  const src = String(text || "");
+  const mid = (a3, b3) => (num2(a3) + num2(b3)) / 2;
+  const collect = (t4, unit) => {
+    const vals = [];
+    const u3 = unit === "엔" ? "엔" : "원(?![가-힣])";
+    const rng = new RegExp(`([\\d,]{${unit === "엔" ? 1 : 2},})\\s*${unit}?\\s*[~\\-–]\\s*([\\d,]+)\\s*${u3}`, "g");
+    const one = new RegExp(`([\\d,]{${unit === "엔" ? 1 : 2},})\\s*${u3}`, "g");
+    t4 = t4.replace(rng, (_2, a3, b3) => {
+      vals.push(mid(a3, b3));
+      return " ";
+    });
+    t4.replace(one, (_2, a3) => {
+      vals.push(num2(a3));
+      return "";
+    });
+    return vals;
+  };
+  const pick = (vals) => choice ? vals.reduce((a3, v3) => a3 + v3, 0) / vals.length : vals.reduce((a3, v3) => a3 + v3, 0);
+  const yen = collect(src.replace(/\([^()]*엔[^()]*\)/g, " "), "엔");
+  if (yen.length) return Math.round(pick(yen) * yenRate);
+  const won = collect(src, "원");
+  if (won.length) return Math.round(pick(won));
+  return /무료|free/i.test(src) ? 0 : null;
+}
+var padTime = (t4) => t4 && /^\d:\d{2}$/.test(t4) ? `0${t4}` : t4 || "";
+var TAIL_HEAD = /(예상\s*비용|비용\s*요약|총\s*예산|경비\s*요약|준비물\s*목록|참고\s*사항|주의\s*사항)|^\s*\d+\.\s+\S/;
+function parseTabbed(text, opts) {
+  const oneLineRows = String(text || "").includes("\u2028") || opts.oneLineRows;
+  const lines = String(text || "").split("\n");
+  const isRowStart = (l3) => {
+    const i3 = l3.indexOf("	");
+    return i3 > 0 && ROW_TIME.test(l3.slice(0, i3));
+  };
+  if (lines.filter(isRowStart).length < 2) return null;
+  const yenRate = opts.yenRate || 9.2;
+  const days = [];
+  let cur = null, block = null;
+  const flush = () => {
+    if (!block || !cur) {
+      block = null;
+      return;
+    }
+    const cells = block.join("\n").replace(/\u2028/g, "\n").split("	");
+    const tm = cells[0].trim().match(ROW_TIME) || [];
+    const body = (cells[1] || "").split("\n").map((x2) => x2.trim()).filter(Boolean);
+    const costCell = cells.slice(2).join("\n").trim();
+    const choice = CHOICE_RE.test(`${body[0] || ""} ${costCell}`);
+    cur.items.push({
+      time: padTime(tm[1]),
+      endTime: padTime(tm[2]),
+      text: body[0] || "",
+      note: body.slice(1).join("\n"),
+      costNote: costCell,
+      cost: costAll(costCell, yenRate, choice),
+      kind: kindOf(`${body[0] || ""} ${costCell}`)
+    });
+    block = null;
+  };
+  for (const raw of lines) {
+    const l3 = raw.replace(/\r/g, "");
+    const d3 = l3.trim().match(DAY_HEAD);
+    if (d3 && !l3.includes("	")) {
+      flush();
+      const md2 = l3.match(MD_RE);
+      cur = {
+        dayNo: parseInt(d3[1] || d3[2], 10),
+        date: "",
+        month: md2 ? +md2[1] : null,
+        day: md2 ? +md2[2] : null,
+        title: l3.replace(/\s+/g, " ").trim(),
+        items: []
+      };
+      days.push(cur);
+      continue;
+    }
+    if (/^\s*시간\s*\t/.test(l3)) {
+      flush();
+      continue;
+    }
+    if (isRowStart(l3)) {
+      flush();
+      block = [l3];
+      if (oneLineRows) flush();
+      continue;
+    }
+    if (!block) continue;
+    const tabs = (block.join("\n").match(/\t/g) || []).length;
+    if (tabs >= 2 && TAIL_HEAD.test(l3.trim())) {
+      flush();
+      continue;
+    }
+    block.push(l3);
+  }
+  flush();
+  return days.filter((d3) => d3.items.length);
+}
+function fillDates(days, startDate) {
+  if (!startDate) return;
+  const base2 = /* @__PURE__ */ new Date(`${startDate}T00:00:00`);
+  for (const dd of days) {
+    const x2 = new Date(base2);
+    x2.setDate(x2.getDate() + (dd.dayNo - 1));
+    dd.date = `${x2.getFullYear()}-${String(x2.getMonth() + 1).padStart(2, "0")}-${String(x2.getDate()).padStart(2, "0")}`;
+  }
+}
+function readPlan(src, opts = {}) {
+  const s3 = String(src || "");
+  const isHtml = /<\/?[a-z][\s\S]*>/i.test(s3);
+  const tabbed = isHtml ? htmlToTabbed(s3) : s3;
+  let days = parseTabbed(tabbed, opts);
+  if (!days || !days.length) {
+    days = parseItinerary(isHtml ? tabbed : s3, opts).days.map((d3) => ({
+      ...d3,
+      items: d3.items.map((it) => {
+        const parts = String(it.text || "");
+        return { ...it, time: padTime(it.time), endTime: padTime(it.endTime), text: parts.slice(0, 60), note: parts.length > 60 ? parts.slice(60) : "", costNote: "" };
+      })
+    }));
+  }
+  fillDates(days, opts.startDate);
+  days.forEach((d3) => d3.items.forEach((it, i3) => {
+    it.id = `${d3.dayNo}-${i3 + 1}`;
+  }));
+  return { days, parsed: days.length > 0 };
+}
+function planV2(plan, opts = {}) {
+  if (!plan) return { days: [], marks: {}, v2: false };
+  if (plan.v === 2 && Array.isArray(plan.days)) return { days: plan.days, marks: plan.marks || {}, v2: true };
+  const { days } = readPlan(plan.raw || "", opts);
+  return { days, marks: remapMarks(plan.marks || {}, days), v2: false };
+}
+var squash = (t4) => String(t4 || "").replace(/\s+/g, "");
+var titleKey = (t4) => squash(String(t4 || "").replace(/(약\s*)?[\d,]+\s*(엔|원)(\s*[~\-–]\s*[\d,]+\s*(엔|원))?/g, "")).replace(/[()·,.]/g, "");
+function remapMarks(oldMarks, days) {
+  const out = {};
+  for (const [k3, v3] of Object.entries(oldMarks || {})) {
+    const [dayNo, time, head] = k3.split("|");
+    if (!head && head !== "") continue;
+    const d3 = (days || []).find((x2) => String(x2.dayNo) === dayNo);
+    if (!d3) continue;
+    const it = d3.items.find((x2) => x2.time === time && (squash(`${x2.text}${x2.note || ""}`).startsWith(head) || head.startsWith(squash(x2.text).slice(0, 20))));
+    if (it) out[it.id] = v3;
+  }
+  return out;
+}
+function carryMarks(oldDays, oldMarks, newDays) {
+  const out = {};
+  for (const d3 of oldDays || []) for (const it of d3.items || []) {
+    const v3 = (oldMarks || {})[it.id];
+    if (!v3) continue;
+    const nd = (newDays || []).find((x2) => x2.dayNo === d3.dayNo);
+    const m3 = nd && nd.items.find((x2) => x2.time === it.time && titleKey(x2.text) === titleKey(it.text));
+    if (m3) out[m3.id] = v3;
+  }
+  return out;
+}
+function planCostV2(days, marks) {
   const mk = marks || {};
   const byDay = [];
+  let total = 0;
+  const kinds = {};
   for (const d3 of days || []) {
-    const kinds = {};
+    const dk = {};
     let sum = 0;
     for (const it of d3.items || []) {
-      if (mk[itemKey(d3.dayNo, it)] === "skip") continue;
-      if (!it.cost) continue;
-      kinds[it.kind] = (kinds[it.kind] || 0) + it.cost;
+      if (mk[it.id] === "skip" || !it.cost) continue;
+      dk[it.kind || "etc"] = (dk[it.kind || "etc"] || 0) + it.cost;
       sum += it.cost;
     }
-    byDay.push({ dayNo: d3.dayNo, date: d3.date, total: sum, kinds });
+    byDay.push({ dayNo: d3.dayNo, date: d3.date, total: sum, kinds: dk });
+    total += sum;
+    for (const [k3, v3] of Object.entries(dk)) kinds[k3] = (kinds[k3] || 0) + v3;
   }
-  const all = {};
-  let total = 0;
-  for (const b3 of byDay) {
-    total += b3.total;
-    for (const [k3, v3] of Object.entries(b3.kinds)) all[k3] = (all[k3] || 0) + v3;
+  return { byDay, total, kinds };
+}
+function parseCostInput(s3, yenRate = 9.2) {
+  const t4 = String(s3 || "").trim();
+  if (!t4) return null;
+  if (/엔|円|¥|jpy/i.test(t4)) return Math.round(num2(t4) * yenRate);
+  const man = t4.match(/^([\d.]+)\s*만/);
+  if (man) return Math.round(parseFloat(man[1]) * 1e4);
+  const n3 = num2(t4);
+  return Number.isFinite(n3) ? n3 : null;
+}
+var W = (n3) => `₩${Math.round(n3 || 0).toLocaleString("ko-KR")}`;
+var md = (iso) => iso ? `${+iso.slice(5, 7)}/${+iso.slice(8, 10)}` : "";
+function estimateText(trip, days, marks, heads) {
+  const h3 = Math.max(1, heads || 1);
+  const c3 = planCostV2(days, marks);
+  const range = trip.startDate ? ` · ${md(trip.startDate)}~${md(trip.endDate)}` : "";
+  const out = [`${trip.name} 예상 경비${h3 > 1 ? ` · ${h3}명` : ""}${range}`, `총액  ${W(c3.total)}`];
+  if (h3 > 1) out.push(`1인  ${W(Math.round(c3.total / h3))}`);
+  out.push("——————————", "[항목별 예상 비용]");
+  let n3 = 0;
+  for (const d3 of days || []) {
+    const its = (d3.items || []).filter((it) => (marks || {})[it.id] !== "skip" && it.cost);
+    if (!its.length) continue;
+    out.push("", `${d3.dayNo}일차${d3.date ? ` ${md(d3.date)}` : ""}`);
+    for (const it of its) {
+      out.push(`${it.time ? `${it.time}  ` : ""}${it.text}  ${W(it.cost)}`);
+      n3++;
+    }
+    const b3 = c3.byDay.find((x2) => x2.dayNo === d3.dayNo);
+    out.push(`   소계 ${W(b3 ? b3.total : 0)}`);
   }
-  return { byDay, total, kinds: all };
+  out.push("", `항목 ${n3}개 합계 ${W(c3.total)} · 취소한 일정은 뺐어요`, "금액이 이상한 항목이 있으면 말씀해 주세요.");
+  return out.join("\n");
+}
+function actualText(trip, s3) {
+  const h3 = Math.max(1, s3.heads || 1);
+  const range = s3.from ? ` · ${md(s3.from)}~${md(s3.to)}` : "";
+  const out = [`${trip.name} 결산${h3 > 1 ? ` · ${h3}명` : ""}${range}`, `총액  ${W(s3.shared)}`];
+  if (h3 > 1) out.push(`1인  ${W(s3.perHead)}`);
+  if (s3.reimbursed > 0) out.push(`이미 받음  ${W(s3.reimbursed)}`);
+  if (h3 > 1) out.push(`보내주실 돈  ${W(Math.max(0, s3.due))}`);
+  out.push("——————————", "[항목별 실제 비용]");
+  for (const e3 of s3.detail || []) out.push(`${md(e3.date)}  ${e3.memo || "내역"}  ${e3.isRefund ? "-" : ""}${W(e3.amount)}`);
+  out.push("", `항목 ${(s3.detail || []).length}개 합계 ${W(s3.shared)}`);
+  if (s3.soloSum > 0) out.push(`개인 비용 ${s3.soloCount}건 ${W(s3.soloSum)}은 뺐어요`);
+  out.push("※ 카드·통장 내역에서 뽑은 금액이라 여행과 상관없는 게 섞였을 수 있어요.", "이상한 항목이 있으면 말씀해 주세요.");
+  return out.join("\n");
+}
+function itineraryHtml(trip, days, marks, opts = {}) {
+  const mk = marks || {};
+  const stamp2 = opts.stamp || "";
+  const range = trip.startDate ? `${trip.startDate.replace(/-/g, ".")} ~ ${(trip.endDate || "").slice(5).replace("-", ".")}` : "";
+  const dayHtml = (days || []).map((d3) => {
+    const its = (d3.items || []).filter((it) => mk[it.id] !== "skip");
+    if (!its.length) return "";
+    const rows = its.map((it) => `
+      <div class="it">
+        <div class="tm">${esc(it.time)}${it.endTime ? `<span>~${esc(it.endTime)}</span>` : ""}</div>
+        <div class="bd"><div class="tt">${esc(it.text)}</div>${it.note ? `<div class="nt">${esc(it.note).replace(/\n/g, "<br>")}</div>` : ""}</div>
+      </div>`).join("");
+    const title = String(d3.title || "").replace(DAY_HEAD, "").replace(/^[\s·\-–:]+/, "");
+    return `
+    <section class="day">
+      <h2><b>${d3.dayNo}일차</b>${d3.date ? ` <span class="dt">${esc(md(d3.date))}</span>` : ""}${title ? ` <span class="sub">${esc(title)}</span>` : ""}</h2>
+      ${rows}
+    </section>`;
+  }).join("");
+  return `<!doctype html>
+<html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${esc(trip.name)} 일정표</title>
+<link href="https://fonts.googleapis.com/css2?family=Nanum+Myeongjo:wght@700;800&family=Noto+Sans+KR:wght@400;600&display=swap" rel="stylesheet">
+<style>
+:root{--paper:#F2E9D8;--card:#FFFDF7;--ink:#2B3A4A;--seal:#B23A24;--line:rgba(43,58,74,.10)}
+*{box-sizing:border-box}
+body{margin:0;background:var(--paper);background-image:repeating-linear-gradient(to bottom,transparent 0 31px,var(--line) 31px 32px);
+ color:var(--ink);font-family:'Noto Sans KR','Apple SD Gothic Neo','Malgun Gothic',sans-serif;line-height:1.55}
+.wrap{max-width:680px;margin:0 auto;padding:28px 16px 48px}
+h1{font-family:'Nanum Myeongjo','Apple SD Gothic Neo',serif;font-weight:800;font-size:28px;margin:0;text-align:center}
+.bar{width:44px;height:3px;background:var(--seal);margin:10px auto 6px;border-radius:2px}
+.meta{text-align:center;font-size:14px;opacity:.8}
+.stamp{text-align:center;font-size:12px;color:var(--seal);margin-top:4px}
+.day{background:var(--card);border:1px solid rgba(43,58,74,.12);border-radius:12px;padding:14px 14px 6px;margin-top:18px}
+h2{font-family:'Nanum Myeongjo',serif;font-size:18px;margin:0 0 8px;border-bottom:1px dashed rgba(43,58,74,.25);padding-bottom:8px}
+h2 b{color:var(--seal)} .dt{font-size:14px;opacity:.75} .sub{display:block;font-family:'Noto Sans KR',sans-serif;font-size:13px;font-weight:400;opacity:.8;margin-top:2px}
+.it{display:flex;gap:12px;padding:8px 0;border-bottom:1px dotted rgba(43,58,74,.15)} .it:last-child{border-bottom:0}
+.tm{flex:0 0 58px;font-weight:600;font-variant-numeric:tabular-nums} .tm span{display:block;font-weight:400;font-size:12px;opacity:.7}
+.bd{flex:1;min-width:0} .tt{font-weight:600} .nt{font-size:13px;opacity:.78;margin-top:2px;overflow-wrap:anywhere}
+</style></head>
+<body><div class="wrap">
+<h1>${esc(trip.name)}</h1><div class="bar"></div>
+${range ? `<div class="meta">${esc(range)}</div>` : ""}
+${stamp2 ? `<div class="stamp">${esc(stamp2)} 기준 일정</div>` : ""}
+${dayHtml}
+</div></body></html>`;
 }
 
 // src/views.js
@@ -4747,10 +5046,10 @@ function ImportPanel({ db, entries, onImport, onClose, flash }) {
     </div>`;
 }
 function FileCheck({ c: c3 }) {
-  const W = (n3) => `₩${formatWon(n3)}`;
+  const W2 = (n3) => `₩${formatWon(n3)}`;
   const lines = [];
   if (c3.totals) {
-    lines.push(c3.totals.ok ? html`<div class="chkOk">✓ 파일 합계와 일치 (출금 ${W(c3.outSum)} · 입금 ${W(c3.inSum)})</div>` : html`<div class="gapWarn">파일 합계와 <b>${W(c3.totals.diff)}</b> 차이 — 못 읽은 줄이 있어요</div>`);
+    lines.push(c3.totals.ok ? html`<div class="chkOk">✓ 파일 합계와 일치 (출금 ${W2(c3.outSum)} · 입금 ${W2(c3.inSum)})</div>` : html`<div class="gapWarn">파일 합계와 <b>${W2(c3.totals.diff)}</b> 차이 — 못 읽은 줄이 있어요</div>`);
   }
   if (c3.chain) {
     lines.push(c3.chain.breaks === 0 && !c3.chain.noBal ? html`<div class="chkOk">✓ 거래 후 잔액이 처음부터 끝까지 이어져요</div>` : html`<div class="gapWarn">잔액이 <b>${c3.chain.breaks}곳</b>에서 끊겨요${c3.chain.first ? ` (처음 ${c3.chain.first.slice(5).replace("-", "/")} 부근)` : ""}${c3.chain.noBal ? ` · 잔액을 못 읽은 줄 ${c3.chain.noBal}개` : ""} — 빠진 줄이 있거나 금액을 잘못 읽었을 수 있어요. 은행에서 받은 원본 파일인지 확인해 주세요</div>`);
@@ -5637,11 +5936,19 @@ function restoreSettingsFrom(d3, backup) {
   for (const k3 of ["settings", "rules", "accounts", "fixed"]) sent[k3] = { h: "", at: 0 };
   sent.__v35 = true;
   st.metaSent = sent;
+  for (const [k3, v3] of Object.entries(d3.settings || {})) {
+    if (Array.isArray(v3) && Array.isArray(st[k3]) && v3.every((x2) => typeof x2 === "string")) {
+      st[k3] = [.../* @__PURE__ */ new Set([...v3, ...st[k3]])];
+    }
+  }
   const pick = (k3) => Array.isArray(backup[k3]) ? backup[k3] : d3[k3] || [];
+  const nowRules = d3.categoryRules || [];
+  const nowKeys = new Set(nowRules.map((r3) => r3.normKey));
+  const rules = [...nowRules, ...(Array.isArray(backup.categoryRules) ? backup.categoryRules : []).filter((r3) => r3 && !nowKeys.has(r3.normKey))];
   const next = {
     ...d3,
     settings: st,
-    categoryRules: pick("categoryRules"),
+    categoryRules: rules,
     accounts: pick("accounts"),
     fixedExpenses: pick("fixedExpenses"),
     vehicles: pick("vehicles"),
@@ -6196,6 +6503,13 @@ function App() {
     return next;
   });
   const live = T2(() => db.entries.filter((e3) => !e3.deleted), [db.entries]);
+  h2(() => {
+    const ids = fxTopupTwins(db.entries, db.settings);
+    if (!ids.length) return;
+    const set = new Set(ids);
+    const now = Date.now();
+    setDb((prev) => ({ ...prev, entries: prev.entries.map((e3) => set.has(e3.id) ? { ...e3, type: "transfer", transferKind: "fxTopup", category: "etc", needsCheck: false, status: "confirmed", updatedAt: now, dirty: true } : e3) }));
+  }, [db.entries]);
   h2(() => {
     if (!db.fixedExpenses.length) return;
     const drafts = buildScheduled(db.fixedExpenses, db.entries, {});
@@ -6754,8 +7068,8 @@ function App() {
     const q3 = query.trim().toLowerCase();
     if (!q3) return [];
     const qNum = q3.replace(/[^\d]/g, "");
-    const md = q3.match(/(\d{1,2})\s*[월/.\-]\s*(\d{1,2})\s*일?/);
-    const qDate = md ? `-${String(md[1]).padStart(2, "0")}-${String(md[2]).padStart(2, "0")}` : "";
+    const md2 = q3.match(/(\d{1,2})\s*[월/.\-]\s*(\d{1,2})\s*일?/);
+    const qDate = md2 ? `-${String(md2[1]).padStart(2, "0")}-${String(md2[2]).padStart(2, "0")}` : "";
     return live.filter((e3) => {
       const cat = CAT_MAP2[e3.category]?.label || "";
       const tn = e3.tripId ? db.trips.find((t4) => t4.id === e3.tripId)?.name || "" : "";
@@ -7212,10 +7526,10 @@ function ro(word) {
 }
 function TripView({ db, live, tripId, setTripId, rowProps, patch, flash, shareText }) {
   const [planOpen, setPlanOpen] = d2(false);
-  const [planShareCost, setPlanShareCost] = d2(true);
-  const [settleDetail, setSettleDetail] = d2(true);
   const [planText, setPlanText] = d2("");
-  const [editCost, setEditCost] = d2(null);
+  const [editItem, setEditItem] = d2(null);
+  const [settleMode, setSettleMode] = d2(null);
+  const planFileRef = A2(null);
   const [adding, setAdding] = d2(false);
   const [form, setForm] = d2({ name: "", startDate: todayISO2(), endDate: todayISO2() });
   const [editDates, setEditDates] = d2(null);
@@ -7362,33 +7676,29 @@ function TripView({ db, live, tripId, setTripId, rowProps, patch, flash, shareTe
       byCat[e3.category] = (byCat[e3.category] || 0) + (e3.isRefund ? -e3.amount : e3.amount);
     }
     const catList = Object.entries(byCat).sort((a3, b3) => b3[1] - a3[1]);
-    const W = (n3) => `₩${formatWon2(n3)}`;
+    const W2 = (n3) => `₩${formatWon2(n3)}`;
     const detail = items.filter((e3) => !soloIds.has(e3.id)).slice().sort((a3, b3) => a3.date < b3.date ? -1 : a3.date > b3.date ? 1 : 0);
-    const settleText = [
-      `${t4.name} 정산${heads > 1 ? ` · ${heads}명` : ""}${sm.from ? ` · ${sm.from.slice(5).replace("-", "/")} ~ ${sm.to.slice(5).replace("-", "/")}` : ""}`,
-      `보내주실 돈  ${W(Math.max(0, due))}`,
-      "——————————",
-      `같이 쓴 돈  ${W(shared)}`,
-      ...catList.map(([k3, v3]) => `  ${(CAT_MAP2[k3] || {}).label || k3} ${W(v3)}`),
-      "",
-      `${heads}명이 나눔 → 1인 ${W(perHead)}`,
-      ...sm.reimbursed > 0 ? [`이미 받음  ${W(sm.reimbursed)}`] : [],
-      ...settleDetail ? [
-        "",
-        "※ 카드·통장 내역에서 자동으로 뽑은 금액이라",
-        "   여행과 상관없는 게 섞였을 수 있어요.",
-        "   아래 훑어보고 이상한 것 있으면 말씀해 주세요.",
-        "",
-        "[상세]",
-        ...detail.map((e3) => `${e3.date.slice(5).replace("-", "/")}  ${e3.memo || "내역"}  ${e3.isRefund ? "-" : ""}${W(e3.amount)}`),
-        ...soloSum > 0 ? ["", `개인 비용 ${solo.length}건 ${W(soloSum)}은 뺐습니다`] : []
-      ] : []
-    ].join("\n");
+    const pvS = planV2(t4.plan, { startDate: t4.startDate, yenRate: parseFloat(db.settings.yenRate) || 9.2 });
+    const planSum = planCostV2(pvS.days, pvS.marks).total;
+    const hasActual = items.length > 0, hasPlan = planSum > 0;
+    const mode2 = settleMode && (settleMode === "plan" && hasPlan || settleMode === "actual" && hasActual) ? settleMode : hasActual ? "actual" : "plan";
+    const settleText = mode2 === "plan" ? estimateText(t4, pvS.days, pvS.marks, heads) : actualText(t4, {
+      shared,
+      perHead,
+      heads,
+      due,
+      reimbursed: sm.reimbursed,
+      soloCount: solo.length,
+      soloSum,
+      detail,
+      from: sm.from,
+      to: sm.to
+    });
     return html4`
           <div class="card">
             <div class="cardLabel">
               <span>정산</span>
-              <button class="pickToggle" onClick=${() => shareText(`${t4.name} 정산`, settleText)}>결산 보내기</button>
+              ${(hasActual || hasPlan) && html4`<button class="pickToggle" onClick=${() => shareText(`${t4.name} ${mode2 === "plan" ? "예상 경비" : "결산"}`, settleText)}>결산 보내기${hasActual && hasPlan ? "" : mode2 === "plan" ? " (예상)" : ""}</button>`}
             </div>
             <div class="row wrap">
               <span class="hint sm">몇 명이서</span>
@@ -7410,10 +7720,14 @@ function TripView({ db, live, tripId, setTripId, rowProps, patch, flash, shareTe
     }} />
             </div>
             <div class="hint sm">내가 전부 내고 나중에 나누는 방식입니다. 나 혼자 쓴 돈은 <b>항목 조정</b>에서 '개인'을 눌러 빼세요.</div>
-            <label class="planShareOpt">
-              <input type="checkbox" checked=${settleDetail} onChange=${() => setSettleDetail((v3) => !v3)} />
-              상세 내역도 함께 보내기 — 동행자가 이상한 항목을 짚어줄 수 있어요
-            </label>
+            ${hasActual && hasPlan && html4`
+              <div class="row wrap settleMode">
+                <span class="hint sm">보낼 기준</span>
+                <button class=${"chip sm" + (mode2 === "plan" ? " on" : "")} onClick=${() => setSettleMode("plan")}>일정표 예상</button>
+                <button class=${"chip sm" + (mode2 === "actual" ? " on" : "")} onClick=${() => setSettleMode("actual")}>실제 쓴 돈</button>
+              </div>`}
+            <div class="hint sm">맨 위에 총액과 1인 몫, 아래에 항목별 비용이 함께 가요 — 동행자가 항목을 짚어 확인할 수 있어요.
+              ${heads === 1 ? html4` <b>1인 몫을 붙이려면 인원을 넣어 주세요.</b>` : ""}</div>
             <div class="axes">
               <div class="axis"><span class="axisLabel">같이 쓴 돈</span><span class="axisVal">₩${formatWon2(shared)}</span></div>
               ${soloSum > 0 && html4`<div class="axis"><span class="axisLabel">개인 비용 ${solo.length}건</span><span class="axisVal">₩${formatWon2(soloSum)}</span></div>`}
@@ -7431,109 +7745,190 @@ function TripView({ db, live, tripId, setTripId, rowProps, patch, flash, shareTe
     const today = todayISO2();
     const inTrip = t4.startDate && t4.endDate && today >= t4.startDate && today <= t4.endDate;
     const yenRate = parseFloat(db.settings.yenRate) || 9.2;
-    const parsed = plan ? parseItinerary(plan.raw || "", { startDate: t4.startDate, yenRate }) : null;
-    const days = parsed ? parsed.days : [];
-    const costOverride = plan && plan.costs || {};
-    const marks = plan && plan.marks || {};
-    const cost = planCost(days, marks);
+    const pv = planV2(plan, { startDate: t4.startDate, yenRate });
+    const days = pv.days;
+    const marks = pv.marks;
+    const cost = planCostV2(days, marks);
     const heads = Math.max(1, parseInt(t4.headcount, 10) || 1);
-    const cycleMark = (dayNo, it) => {
-      const k3 = itemKey(dayNo, it);
+    const planTotal = cost.total;
+    const todayDay = days.find((d3) => d3.date === today);
+    const editPlan = (fn) => patch((d3) => {
+      d3.trips = d3.trips.map((x2) => {
+        if (x2.id !== t4.id) return x2;
+        const cur = planV2(x2.plan, { startDate: x2.startDate, yenRate });
+        const ds = JSON.parse(JSON.stringify(cur.days));
+        const mk = { ...cur.marks };
+        fn(ds, mk);
+        const { costs, ...rest } = x2.plan || {};
+        return { ...x2, plan: { ...rest, v: 2, days: ds, marks: mk, savedAt: Date.now() } };
+      });
+    });
+    const cycleMark = (id) => editPlan((ds, mk) => {
       const nextOf = { "": "done", done: "skip", skip: "" };
+      const nv = nextOf[mk[id] || ""];
+      if (nv) mk[id] = nv;
+      else delete mk[id];
+    });
+    const openEdit = (d3, it) => setEditItem(it ? { dayNo: d3.dayNo, id: it.id, time: it.endTime ? `${it.time}~${it.endTime}` : it.time, text: it.text, note: it.note || "", cost: it.cost ? String(it.cost) : "" } : { dayNo: d3.dayNo, id: null, time: "", text: "", note: "", cost: "" });
+    const saveItem = () => {
+      const ei = editItem;
+      const tm = String(ei.time || "").match(/(\d{1,2}:\d{2})\s*(?:[~\-–]\s*(\d{1,2}:\d{2}))?/) || [];
+      const c3 = parseCostInput(ei.cost, yenRate);
+      editPlan((ds) => {
+        const d3 = ds.find((x2) => x2.dayNo === ei.dayNo);
+        if (!d3) return;
+        const fields = {
+          time: padTime(tm[1]),
+          endTime: padTime(tm[2]),
+          text: ei.text.trim(),
+          note: ei.note.trim(),
+          cost: c3 == null ? null : c3,
+          kind: kindOf(`${ei.text} ${ei.note}`)
+        };
+        if (ei.id) d3.items = d3.items.map((x2) => x2.id === ei.id ? { ...x2, ...fields } : x2);
+        else d3.items.push({ id: `${ei.dayNo}-n${Date.now().toString(36)}`, costNote: "", ...fields });
+        d3.items.sort((p3, q3) => (p3.time || "99:99").localeCompare(q3.time || "99:99"));
+      });
+      setEditItem(null);
+      flash(ei.id ? "일정을 고쳤어요" : "일정을 넣었어요");
+    };
+    const removeItem = () => {
+      const ei = editItem;
+      editPlan((ds, mk) => {
+        const d3 = ds.find((x2) => x2.dayNo === ei.dayNo);
+        if (d3) d3.items = d3.items.filter((x2) => x2.id !== ei.id);
+        delete mk[ei.id];
+      });
+      setEditItem(null);
+      flash("일정을 뺐어요");
+    };
+    const savePlan = (text) => {
       patch((d3) => {
         d3.trips = d3.trips.map((x2) => {
           if (x2.id !== t4.id) return x2;
-          const m3 = { ...x2.plan && x2.plan.marks || {} };
-          const nv = nextOf[m3[k3] || ""];
-          if (nv) m3[k3] = nv;
-          else delete m3[k3];
-          return { ...x2, plan: { ...x2.plan || {}, marks: m3 } };
+          const cur = planV2(x2.plan, { startDate: x2.startDate, yenRate });
+          const nx = readPlan(text, { startDate: x2.startDate, yenRate });
+          return { ...x2, plan: { v: 2, raw: text, days: nx.days, marks: carryMarks(cur.days, cur.marks, nx.days), savedAt: Date.now() } };
         });
-      });
-    };
-    for (const b3 of cost.byDay) {
-      const o3 = costOverride[b3.dayNo];
-      if (o3) {
-        b3.total = Object.values(o3).reduce((a3, v3) => a3 + v3, 0);
-        b3.kinds = { ...o3 };
-      }
-    }
-    const planTotal = cost.byDay.reduce((a3, b3) => a3 + b3.total, 0);
-    const todayDay = days.find((d3) => d3.date === today);
-    const savePlan = (text) => {
-      patch((d3) => {
-        d3.trips = d3.trips.map((x2) => x2.id === t4.id ? { ...x2, plan: { raw: text, savedAt: Date.now(), costs: x2.plan && x2.plan.costs || {} } } : x2);
       });
       setPlanOpen(false);
       setPlanText("");
-      flash("일정표를 저장했어요");
+      flash(text.trim() ? "일정표를 저장했어요" : "일정표를 지웠어요");
     };
+    const pickFile = (ev) => {
+      const f3 = ev.target.files && ev.target.files[0];
+      if (!f3) return;
+      const r3 = new FileReader();
+      r3.onload = () => {
+        try {
+          setPlanText(decodeCSVBuffer(new Uint8Array(r3.result)));
+        } catch (e3) {
+          flash("파일을 읽지 못했어요");
+        }
+        ev.target.value = "";
+      };
+      r3.readAsArrayBuffer(f3);
+    };
+    const preview = planOpen && planText.trim() ? readPlan(planText, { startDate: t4.startDate, yenRate }) : null;
+    const sendPlanFile = async () => {
+      const stamp2 = `${+today.slice(5, 7)}/${+today.slice(8, 10)}`;
+      const htmlText = itineraryHtml(t4, days, marks, { stamp: stamp2 });
+      const name = `${t4.name}-일정표.html`;
+      const blob = new Blob([htmlText], { type: "text/html" });
+      try {
+        const file = new File([blob], name, { type: "text/html" });
+        if (navigator.canShare && navigator.canShare({ files: [file] })) {
+          await navigator.share({ files: [file], title: `${t4.name} 일정표` });
+          return;
+        }
+      } catch (e3) {
+        if (e3 && e3.name === "AbortError") return;
+      }
+      const url = URL.createObjectURL(blob);
+      const a3 = document.createElement("a");
+      a3.href = url;
+      a3.download = name;
+      document.body.appendChild(a3);
+      a3.click();
+      a3.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 5e3);
+      flash("일정표 파일을 내려받았어요 — 카카오톡으로 보내세요");
+    };
+    const Row = (d3, it) => html4`
+          <div class=${"planItem mk-" + (marks[it.id] || "none")} key=${it.id}>
+            <button class="planMark" title="다녀옴 · 취소 표시" onClick=${() => cycleMark(it.id)}>${marks[it.id] === "done" ? "✓" : marks[it.id] === "skip" ? "✗" : "○"}</button>
+            <button class="planBody" onClick=${() => openEdit(d3, it)}>
+              <span class="planTime">${it.time}</span>
+              <span class="planText">${it.text}${it.note ? html4`<span class="planNote">${it.note.split("\n")[0]}</span>` : ""}</span>
+              ${it.cost ? html4`<span class="planCost">₩${formatWon2(it.cost)}</span>` : ""}
+            </button>
+          </div>`;
     return html4`
           <div class="card planCard">
             <div class="cardLabel">
               일정표
-              ${days.length > 0 && html4`
+              <span class="row">
+                ${days.length > 0 && html4`<button class="pickToggle" onClick=${sendPlanFile}>일정표 파일 보내기</button>`}
                 <button class="pickToggle" onClick=${() => {
-      const W = (n3) => `₩${formatWon2(n3)}`;
-      const lines = [`${t4.name}${t4.startDate ? `   ${t4.startDate.slice(5).replace("-", "/")} ~ ${(t4.endDate || "").slice(5).replace("-", "/")}` : ""}`];
-      for (const d3 of days) {
-        const c3 = cost.byDay.find((b3) => b3.dayNo === d3.dayNo) || { total: 0 };
-        lines.push("", `[${d3.dayNo}일차]${d3.date ? ` ${d3.date.slice(5).replace("-", "/")}` : ""}`);
-        for (const it of d3.items) {
-          if (marks[itemKey(d3.dayNo, it)] === "skip") continue;
-          lines.push(`${it.time}  ${it.text}${planShareCost && it.cost ? `  ${W(it.cost)}` : ""}`);
-        }
-        if (planShareCost && c3.total) lines.push(`       예상 ${W(c3.total)}`);
-      }
-      if (planShareCost) {
-        lines.push("", `합계 예상 ${W(planTotal)}${heads > 1 ? ` · 1인 ${W(Math.round(planTotal / heads))}` : ""}`);
-      }
-      shareText(`${t4.name} 일정`, lines.join("\n"));
-    }}>일정 보내기</button>`}
-              <button class="pickToggle" onClick=${() => {
       setPlanOpen((v3) => !v3);
-      setPlanText(plan ? plan.raw : "");
+      setPlanText("");
+      setEditItem(null);
     }}>
-                ${plan ? "일정 고치기" : "일정 넣기"}
-              </button>
+                  ${plan && (days.length || plan.raw) ? "새로 넣기" : "일정 넣기"}
+                </button>
+              </span>
             </div>
-            ${days.length > 0 && html4`
-              <label class="planShareOpt">
-                <input type="checkbox" checked=${planShareCost} onChange=${() => setPlanShareCost((v3) => !v3)} />
-                보낼 때 예상 비용도 함께
-              </label>`}
 
             ${planOpen && html4`
-              <div class="hint sm">여행 일정표를 붙여넣으세요. HTML이든 글이든 됩니다.
-                <b>확정 전까지 언제든 바꿔도 됩니다.</b> 일정이 바뀌어도 지출 기록은 그대로입니다.</div>
+              <div class="hint sm">일정표 <b>HTML 파일</b>을 고르거나, 내용을 복사해 붙여넣으세요.
+                넣은 뒤에는 항목을 눌러 하나씩 고칠 수 있어요. 일정이 바뀌어도 지출 기록은 그대로입니다.</div>
+              <div class="acts" style="justify-content:flex-start">
+                <button class="btn ghost sm" onClick=${() => planFileRef.current && planFileRef.current.click()}>HTML 파일 고르기</button>
+              </div>
+              <input ref=${planFileRef} type="file" accept=".html,.htm,.txt,text/html,text/plain" style="display:none" onChange=${pickFile} />
               <textarea class="pasteArea planArea" value=${planText} onInput=${(e3) => setPlanText(e3.target.value)}
-                placeholder=${"예)\n1일 차 (3월 10일, 수)\n10:35 나리타공항 도착\n13:10 점심 1,200엔"}></textarea>
+                placeholder=${"예)\n1일 차 (3월 17일)\n10:35 나하공항 도착\n12:00 점심 소바 1,200엔"}></textarea>
+              ${preview && html4`<div class=${preview.parsed ? "chkOk" : "gapWarn"}>${preview.parsed ? `✓ ${preview.days.length}일 · 일정 ${preview.days.reduce((a3, d3) => a3 + d3.items.length, 0)}개 · 예상 ₩${formatWon2(planCostV2(preview.days, {}).total)} 읽음` : "날짜별로 가르지 못했어요 — 저장하면 글 그대로 보여드려요"}</div>`}
+              ${plan && days.length > 0 && html4`<div class="hint sm">새로 넣으면 지금 일정표를 바꿉니다. 같은 시각·같은 제목 일정에 해 둔 ✓·✗ 는 옮겨 갑니다.</div>`}
               <div class="acts">
-                ${plan && html4`<button class="btn ghost sm" onClick=${() => {
-      savePlan("");
-    }}>일정표 지우기</button>`}
+                ${plan && (days.length || plan.raw) && html4`<button class="btn ghost sm" onClick=${() => savePlan("")}>일정표 지우기</button>`}
                 <button class="btn ghost sm" onClick=${() => setPlanOpen(false)}>그만두기</button>
                 <button class="btn primary sm" onClick=${() => savePlan(planText)} disabled=${!planText.trim()}>저장</button>
               </div>`}
 
-            ${!planOpen && !plan && html4`<div class="hint sm">일정표를 넣어두면 여행 중에 여기서 바로 볼 수 있어요.</div>`}
+            ${!planOpen && !(plan && (days.length || plan.raw)) && html4`<div class="hint sm">일정표를 넣어두면 여행 중에 여기서 바로 보고, 항목마다 다녀옴·취소를 표시할 수 있어요.</div>`}
 
-            ${!planOpen && plan && !days.length && html4`
+            ${!planOpen && plan && !days.length && plan.raw && html4`
               <div class="hint sm">날짜별로 가르지 못해 글 그대로 보여드려요.</div>
               <pre class="planRaw">${(plan.raw || "").slice(0, 4e3)}</pre>`}
 
+            ${editItem && html4`
+              <div class="box planEdit">
+                <div class="boxTop"><span class="maintName">${editItem.dayNo}일차 ${editItem.id ? "일정 고치기" : "일정 추가"}</span></div>
+                <div class="row">
+                  <input class="inp" style="max-width:120px" placeholder="시각 (예: 12:00~13:00)" value=${editItem.time}
+                    onInput=${(e3) => setEditItem({ ...editItem, time: e3.target.value })} />
+                  <input class="inp" placeholder="예상 비용 (예: 1,200엔 · 15000)" value=${editItem.cost}
+                    onInput=${(e3) => setEditItem({ ...editItem, cost: e3.target.value })} />
+                </div>
+                <input class="inp" placeholder="일정 (예: 점심 소바)" value=${editItem.text}
+                  onInput=${(e3) => setEditItem({ ...editItem, text: e3.target.value })} />
+                <textarea class="pasteArea" style="min-height:64px" placeholder="메모 (동선·준비물 등, 안 적어도 됩니다)" value=${editItem.note}
+                  onInput=${(e3) => setEditItem({ ...editItem, note: e3.target.value })}></textarea>
+                ${editItem.cost && parseCostInput(editItem.cost, yenRate) != null && /엔|円|¥|jpy/i.test(editItem.cost) ? html4`<div class="hint sm">₩${formatWon2(parseCostInput(editItem.cost, yenRate))} (1엔 = ${yenRate}원)</div>` : ""}
+                <div class="acts">
+                  ${editItem.id && html4`<button class="btn ghost sm" onClick=${removeItem}>일정 빼기</button>`}
+                  <button class="btn ghost sm" onClick=${() => setEditItem(null)}>그만두기</button>
+                  <button class="btn primary sm" disabled=${!editItem.text.trim()} onClick=${saveItem}>저장</button>
+                </div>
+              </div>`}
+
             ${!planOpen && days.length > 0 && html4`
+              <div class="hint sm">○ 를 누르면 다녀옴 ✓ · 취소 ✗ 로 바뀌고, 일정을 누르면 고칠 수 있어요.</div>
               ${inTrip && todayDay && html4`
                 <div class="planToday">
                   <div class="planTodayHead">오늘 · ${todayDay.dayNo}일차</div>
-                  ${todayDay.items.map((it, i3) => html4`
-                    <button class=${"planItem mk-" + (marks[itemKey(todayDay.dayNo, it)] || "none")} key=${i3}
-                      onClick=${() => cycleMark(todayDay.dayNo, it)}>
-                      <span class="planMark">${marks[itemKey(todayDay.dayNo, it)] === "done" ? "✓" : marks[itemKey(todayDay.dayNo, it)] === "skip" ? "✗" : "○"}</span>
-                      <span class="planTime">${it.time}</span>
-                      <span class="planText">${it.text}</span>
-                      ${it.cost ? html4`<span class="planCost">₩${formatWon2(it.cost)}</span>` : ""}
-                    </button>`)}
+                  ${todayDay.items.map((it) => Row(todayDay, it))}
                 </div>`}
 
               <div class="planDays">
@@ -7541,52 +7936,19 @@ function TripView({ db, live, tripId, setTripId, rowProps, patch, flash, shareTe
       const c3 = cost.byDay.find((b3) => b3.dayNo === d3.dayNo) || { total: 0, kinds: {} };
       const spent = d3.date ? live.filter((e3) => e3.tripId === t4.id && e3.date === d3.date && e3.type === "expense" && !e3.isRefund && !e3.transferKind).reduce((a3, e3) => a3 + e3.amount, 0) : 0;
       return html4`
-                    <details class="planDay" key=${d3.dayNo} open=${inTrip && d3.date === today}>
+                    <details class="planDay" key=${d3.dayNo} open=${inTrip && d3.date === today || editItem && editItem.dayNo === d3.dayNo}>
                       <summary>
                         <b>${d3.dayNo}일차</b> ${d3.date ? d3.date.slice(5) : ""}
                         <span class="planSum">예상 ₩${formatWon2(c3.total)}${spent > 0 ? ` · 실제 ₩${formatWon2(spent)}` : ""}</span>
                       </summary>
-                      <div class="planKinds">
-                        ${Object.entries(c3.kinds).map(([k3, v3]) => html4`
-                          <button class="chip sm" key=${k3} onClick=${() => setEditCost({ dayNo: d3.dayNo, kind: k3, value: v3 })}>
-                            ${KIND_LABEL[k3]} ₩${formatWon2(v3)}
-                          </button>`)}
-                        <button class="chip sm ghost" onClick=${() => setEditCost({ dayNo: d3.dayNo, kind: "etc", value: 0 })}>+ 고치기</button>
-                      </div>
-                      ${d3.items.map((it, i3) => html4`
-                        <button class=${"planItem mk-" + (marks[itemKey(d3.dayNo, it)] || "none")} key=${i3}
-                          onClick=${() => cycleMark(d3.dayNo, it)}>
-                          <span class="planMark">${marks[itemKey(d3.dayNo, it)] === "done" ? "✓" : marks[itemKey(d3.dayNo, it)] === "skip" ? "✗" : "○"}</span>
-                          <span class="planTime">${it.time}</span>
-                          <span class="planText">${it.text}</span>
-                          ${it.cost ? html4`<span class="planCost">₩${formatWon2(it.cost)}</span>` : ""}
-                        </button>`)}
+                      ${Object.keys(c3.kinds).length > 0 && html4`<div class="planKinds">
+                        ${Object.entries(c3.kinds).map(([k3, v3]) => html4`<span class="chip sm static" key=${k3}>${KIND_LABEL[k3] || "기타"} ₩${formatWon2(v3)}</span>`)}
+                      </div>`}
+                      ${d3.items.map((it) => Row(d3, it))}
+                      <button class="pickToggle planAdd" onClick=${() => openEdit(d3, null)}>+ 일정 추가</button>
                     </details>`;
     })}
               </div>
-
-              ${editCost && html4`
-                <div class="box">
-                  <div class="boxTop"><span class="maintName">${editCost.dayNo}일차 ${KIND_LABEL[editCost.kind]} 예상 비용</span></div>
-                  <input class="inp" type="number" inputmode="numeric" value=${editCost.value}
-                    onInput=${(e3) => setEditCost({ ...editCost, value: parseInt(e3.target.value || "0", 10) })} />
-                  <div class="acts">
-                    <button class="btn ghost sm" onClick=${() => setEditCost(null)}>그만두기</button>
-                    <button class="btn primary sm" onClick=${() => {
-      patch((d3) => {
-        d3.trips = d3.trips.map((x2) => {
-          if (x2.id !== t4.id) return x2;
-          const base2 = x2.plan && x2.plan.costs || {};
-          const cur = { ...(cost.byDay.find((b3) => b3.dayNo === editCost.dayNo) || {}).kinds, ...base2[editCost.dayNo] || {} };
-          cur[editCost.kind] = editCost.value;
-          return { ...x2, plan: { ...x2.plan || {}, costs: { ...base2, [editCost.dayNo]: cur } } };
-        });
-      });
-      setEditCost(null);
-      flash("예상 비용을 고쳤어요");
-    }}>저장</button>
-                  </div>
-                </div>`}
 
               <div class="planTotal">
                 예상 합계 <b>₩${formatWon2(planTotal)}</b>${heads > 1 ? html4` · 1인 <b>₩${formatWon2(Math.round(planTotal / heads))}</b>` : ""}
@@ -7975,7 +8337,7 @@ function Settings({ db, setDb, onClose, flash, onSync, onUndoImport, onOpenAccou
       ${db.settings.lastSyncAt && html4`<div class="hint sm">마지막 동기화 ${new Date(db.settings.lastSyncAt).toLocaleString("ko-KR")}</div>`}
 
       <div class="setDivider">데이터</div>
-      <div class="setStat">버전 <b>v35</b> · 기록 ${db.entries.filter((e3) => !e3.deleted).length}건 · 분류 규칙 ${(db.categoryRules || []).length}개 · 보낼 것 ${db.entries.filter((e3) => e3.dirty).length}건 · 저장 용량 ${(size / 1024).toFixed(0)}KB</div>
+      <div class="setStat">버전 <b>v36c</b> · 기록 ${db.entries.filter((e3) => !e3.deleted).length}건 · 분류 규칙 ${(db.categoryRules || []).length}개 · 보낼 것 ${db.entries.filter((e3) => e3.dirty).length}건 · 저장 용량 ${(size / 1024).toFixed(0)}KB</div>
 
       <div class="acts">
         <button class="btn ghost sm" onClick=${() => fileRef.current && fileRef.current.click()}>가져오기</button>
