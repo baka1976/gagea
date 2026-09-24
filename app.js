@@ -697,7 +697,12 @@ var CATEGORIES = [
     "멤버십",
     "베트맨",
     "스포츠토토",
-    "케이토토"
+    "케이토토",
+    // 해외 결제 명세서에는 영문으로 찍힌다 (v37)
+    "netflix",
+    "spotify",
+    "youtube",
+    "disney"
   ] },
   { key: "comm", label: "통신", color: "#5A5A5A", words: [
     "통신",
@@ -722,7 +727,19 @@ var CATEGORIES = [
     "세종텔레콤",
     "리브엠",
     "U+유모바일",
-    "이야기모바일"
+    "이야기모바일",
+    // 해외 온라인 구독·클라우드 (v37) — 트래블월렛으로 내도 여행이 아니다
+    "anthropic",
+    "openai",
+    "chatgpt",
+    "github",
+    "notion",
+    "figma",
+    "dropbox",
+    "cloudflare",
+    "amazon web",
+    "microsoft",
+    "adobe"
   ] },
   { key: "insurance", label: "보험", color: "#6B5A7A", words: ["보험", "실손", "상해", "화재보험"] },
   { key: "loan", label: "대출·이자", color: "#8A5A3B", words: ["대출이자", "이자상환", "원리금", "할부이자", "대출상환", "마이너스통장이자"] },
@@ -1719,10 +1736,59 @@ var SYNC_FIELDS = [
   "deleted",
   "status"
 ];
+var EXTRA_FIELDS = [
+  "catBy",
+  "carBy",
+  "memoBy",
+  "familyBy",
+  "welfareBy",
+  "excludedBy",
+  "needsCheck",
+  "isExtra",
+  "isOverseas",
+  "mergedInto",
+  "pairedFrom",
+  "importId",
+  "reimbFrom",
+  "fromAccountId",
+  "toAccountId",
+  "fee",
+  "dateGuessed",
+  "dateFixed"
+];
+var DECISION_FIELDS = ["catBy", "carBy", "memoBy", "familyBy", "welfareBy", "excludedBy", "mergedInto", "pairedFrom", "reimbFrom"];
+function extraOf(e3) {
+  const o3 = {};
+  for (const k3 of EXTRA_FIELDS) if (e3[k3]) o3[k3] = e3[k3];
+  return o3;
+}
+function hasDecision(e3) {
+  return !!e3 && DECISION_FIELDS.some((k3) => !!e3[k3]);
+}
 function slim(e3) {
   const o3 = {};
   for (const k3 of SYNC_FIELDS) if (e3[k3] !== void 0) o3[k3] = e3[k3];
+  if (!e3.xs || hasDecision(e3)) o3.extra = JSON.stringify(extraOf(e3));
   return o3;
+}
+function unpackExtra(r3, cur) {
+  const { extra, ...rest } = r3;
+  let ex = null;
+  if (typeof extra === "string" && extra.trim()) {
+    try {
+      ex = JSON.parse(extra);
+    } catch (err) {
+      ex = null;
+    }
+  }
+  if (!ex || typeof ex !== "object") {
+    return cur ? { ...cur, ...rest } : { ...rest, xs: true };
+  }
+  const base2 = { ...cur || {}, ...rest };
+  for (const k3 of EXTRA_FIELDS) delete base2[k3];
+  for (const k3 of EXTRA_FIELDS) if (ex[k3]) base2[k3] = ex[k3];
+  delete base2.xs;
+  return base2;
 }
 async function post(url, payload) {
   const res = await fetch(url, {
@@ -1771,10 +1837,10 @@ function mergeEntries(local, remote) {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(r3.date || "")) continue;
     const cur = byId.get(r3.id);
     if (!cur) {
-      byId.set(r3.id, { ...r3, dirty: false });
+      byId.set(r3.id, { ...unpackExtra(r3, null), dirty: false });
       added++;
     } else if ((r3.updatedAt || 0) > (cur.updatedAt || 0)) {
-      byId.set(r3.id, { ...cur, ...r3, dirty: false });
+      byId.set(r3.id, { ...unpackExtra(r3, cur), dirty: false });
       updated++;
     }
   }
@@ -1792,20 +1858,29 @@ async function syncOnce(db) {
   return {
     remote: res.entries || [],
     pushed: dirty.map((e3) => ({ id: e3.id, updatedAt: e3.updatedAt || 0 })),
-    serverTime: res.serverTime || (/* @__PURE__ */ new Date()).toISOString()
+    serverTime: res.serverTime || (/* @__PURE__ */ new Date()).toISOString(),
+    serverExtra: !!res.extra
+    // 시트 서버(Code.gs)가 extra 칸을 아는가 (v37)
   };
 }
 function applySync(db, r3) {
   const { list, added, updated } = mergeEntries(db.entries, r3.remote || []);
   const sent = new Map((r3.pushed || []).map((p3) => [p3.id, p3.updatedAt]));
-  return {
-    db: {
-      ...db,
-      entries: list.map((e3) => e3.dirty && sent.has(e3.id) && (e3.updatedAt || 0) <= sent.get(e3.id) ? { ...e3, dirty: false } : e3),
-      settings: { ...db.settings, lastSyncAt: r3.serverTime }
-    },
-    pulled: added + updated
-  };
+  let entries = list.map((e3) => e3.dirty && sent.has(e3.id) && (e3.updatedAt || 0) <= sent.get(e3.id) ? { ...e3, dirty: false } : e3);
+  let settings = { ...db.settings, lastSyncAt: r3.serverTime };
+  let resent = 0;
+  const ms = settings.metaSent || {};
+  if (r3.serverExtra && !ms.__v37) {
+    const now = Date.now();
+    entries = entries.map((e3) => {
+      if (e3.deleted) return e3;
+      if (!hasDecision(e3)) return e3.xs ? e3 : { ...e3, xs: true };
+      resent++;
+      return { ...e3, dirty: true, updatedAt: Math.max(now, (e3.updatedAt || 0) + 1) };
+    });
+    settings = { ...settings, metaSent: { ...ms, __v37: true } };
+  }
+  return { db: { ...db, entries, settings }, pulled: added + updated, resent };
 }
 async function cleanupSheet(sheetUrl, sheetToken) {
   const res = await post(sheetUrl, { token: sheetToken, op: "cleanup" });
@@ -2832,7 +2907,6 @@ function csvToEntries(rows, map, opts = {}) {
       date,
       amount,
       transferKind,
-      needsCheck,
       isExtra,
       category,
       memo: merchant || "내역",
@@ -3033,10 +3107,13 @@ var ONLINE_FOREIGN = [
   "notion",
   "dropbox"
 ];
+function isOnlineForeign(name) {
+  const low = String(name || "").toLowerCase();
+  return ONLINE_FOREIGN.some((w3) => w3.length <= 3 ? new RegExp(`(^|[^a-z0-9])${w3}([^a-z0-9]|$)`).test(low) : low.includes(w3));
+}
 function isLocalSpend(e3) {
   if (!e3 || e3.deleted || e3.type !== "expense") return false;
-  const name = String(e3.memo || "").toLowerCase();
-  if (ONLINE_FOREIGN.some((w3) => name.includes(w3))) return false;
+  if (isOnlineForeign(e3.memo)) return false;
   if (e3.currency && e3.currency !== "KRW") return true;
   if (e3.isOverseas) return true;
   return false;
@@ -3116,6 +3193,41 @@ function isHomeSpend(e3, recurring) {
   const k3 = e3.normKey || normKey(e3.memo);
   return !!(recurring && k3 && recurring.has(k3));
 }
+function pairCancels(list) {
+  const keyOf = (e3) => e3.normKey || normKey(e3.memo);
+  const pays = (list || []).filter((e3) => e3 && !e3.isRefund && !e3.reimbFrom && e3.type === "expense");
+  const cancels = (list || []).filter((e3) => e3 && e3.isRefund && !e3.reimbFrom).sort((a3, b3) => a3.date < b3.date ? -1 : a3.date > b3.date ? 1 : 0);
+  const used = /* @__PURE__ */ new Set();
+  const pairs = [];
+  for (const c3 of cancels) {
+    let best = null;
+    for (const p3 of pays) {
+      if (used.has(p3.id) || keyOf(p3) !== keyOf(c3) || p3.date > c3.date) continue;
+      const fx = p3.currency && p3.currency === c3.currency && p3.foreignAmount != null && c3.foreignAmount != null;
+      const same = fx ? Math.abs(Number(p3.foreignAmount) - Number(c3.foreignAmount)) < 5e-3 : p3.amount === c3.amount;
+      if (!same) continue;
+      if (!best || p3.date > best.date) best = p3;
+    }
+    if (best) {
+      used.add(best.id);
+      used.add(c3.id);
+      pairs.push([best, c3]);
+    }
+  }
+  const byKey = /* @__PURE__ */ new Map();
+  for (const [p3, c3] of pairs) {
+    const k3 = keyOf(p3);
+    if (!byKey.has(k3)) byKey.set(k3, { key: k3, memo: p3.memo, pairs: [] });
+    byKey.get(k3).pairs.push([p3, c3]);
+  }
+  const groups = Array.from(byKey.values()).map((g2) => ({
+    ...g2,
+    ids: g2.pairs.flat().map((e3) => e3.id),
+    net: g2.pairs.reduce((s3, [p3, c3]) => s3 + p3.amount - c3.amount, 0),
+    date: g2.pairs.map(([p3]) => p3.date).sort()[0]
+  }));
+  return { groups, pairedIds: used };
+}
 function buildTripCost(entries, trip, opts = {}) {
   if (!trip || !trip.startDate || !trip.endDate) {
     return { ...trip || {}, inside: [], booked: [], reimb: [], onsite: 0, prepaid: 0, total: 0, welfare: 0 };
@@ -3137,6 +3249,7 @@ function buildTripCost(entries, trip, opts = {}) {
     }
     if (e3.type !== "expense") continue;
     if (e3.category === "family") continue;
+    if (isOnlineForeign(e3.memo) && !(trip.id && e3.tripId === trip.id)) continue;
     const surelyTrip = e3.category === "travel" || e3.isOverseas || e3.currency && e3.currency !== "KRW";
     if (!surelyTrip && isHomeSpend(e3, homeKeys)) continue;
     const welfare = e3.transferKind === "welfare";
@@ -3498,6 +3611,11 @@ function twColumns(rows) {
   }
   return null;
 }
+function twCategory(merchant, rules) {
+  if (matchRule(normKey(merchant), rules)) return detectCategory(merchant, "expense", rules);
+  if (isOnlineForeign(merchant)) return detectCategory(merchant, "expense", rules);
+  return "travel";
+}
 function twEntryFrom(v3, opts = {}) {
   const { date, kind, krw, fxRaw, currency, balance, approval, time, joined, index } = v3;
   let merchant = String(v3.merchant || "").replace(/\s+/g, " ").trim();
@@ -3514,10 +3632,7 @@ function twEntryFrom(v3, opts = {}) {
     merchant = merchant ? `현지 인출 ${merchant}` : "현지 인출";
   }
   if (!merchant) merchant = kind === "adjust" ? "정산" : "내역";
-  if (type === "expense") {
-    const hit = matchRule(normKey(merchant), opts.rules);
-    category = hit ? detectCategory(merchant, "expense", opts.rules) : "travel";
-  }
+  if (type === "expense") category = twCategory(merchant, opts.rules);
   return {
     type,
     direction: inflow ? "in" : "out",
@@ -3735,10 +3850,7 @@ function travelWalletToEntries(rows, opts = {}) {
       merchant = merchant ? `현지 인출 ${merchant}` : "현지 인출";
     }
     if (!merchant) merchant = kind === "adjust" ? "정산" : "내역";
-    if (type === "expense") {
-      const hit = matchRule(normKey(merchant), opts.rules);
-      category = hit ? detectCategory(merchant, "expense", opts.rules) : "travel";
-    }
+    if (type === "expense") category = twCategory(merchant, opts.rules);
     out.push(twEntryFrom({
       date,
       kind,
@@ -3929,6 +4041,15 @@ function reclassifyOne(e3, opts = {}) {
     } else {
       type = "transfer";
       transferKind = null;
+    }
+  } else if (e3.paymentMethod === "travelwallet") {
+    type = "expense";
+    transferKind = null;
+    category = twCategory(base2.counterpartyRaw || base2.memo, opts.rules);
+    const after = applyUserRules({ ...e3, type, category, transferKind }, opts.rules || []);
+    if (after) {
+      category = after.category;
+      if (after.transferKind !== void 0) transferKind = after.transferKind;
     }
   } else {
     type = "expense";
@@ -4463,6 +4584,39 @@ ${range ? `<div class="meta">${esc(range)}</div>` : ""}
 ${stamp2 ? `<div class="stamp">${esc(stamp2)} 기준 일정</div>` : ""}
 ${dayHtml}
 </div></body></html>`;
+}
+function wordsOf(s3) {
+  const low = String(s3 || "").toLowerCase();
+  const ascii = low.match(/[a-z]{3,}/g) || [];
+  const hangul = low.match(/[가-힣]{2,}/g) || [];
+  return { ascii, hangul };
+}
+function findPayments(item, day, entries, opts = {}) {
+  const { tripId, linked = /* @__PURE__ */ new Map() } = opts;
+  const w3 = wordsOf(`${item && item.text || ""} ${item && item.note || ""}`);
+  const cost = Number(item && item.cost) || 0;
+  const out = [];
+  for (const e3 of entries || []) {
+    if (!e3 || e3.deleted || e3.tripId !== tripId || e3.type !== "expense" || e3.isRefund || e3.transferKind) continue;
+    const memo = String(e3.memo || "").toLowerCase();
+    let score = 0;
+    const sameDay = !!(day && day.date && e3.date === day.date);
+    if (sameDay) score += 100;
+    else if (day && day.date) {
+      const gap = Math.abs((Date.parse(e3.date) - Date.parse(day.date)) / 864e5) || 0;
+      score -= Math.min(gap, 60);
+    }
+    for (const a3 of w3.ascii) if (memo.includes(a3)) score += 20;
+    for (const h3 of w3.hangul) if (memo.includes(h3)) score += 20;
+    if (cost > 0 && e3.amount > 0) {
+      const r3 = Math.abs(e3.amount - cost) / cost;
+      if (r3 <= 0.3) score += Math.round(10 * (1 - r3));
+    }
+    const linkedTo = e3.id !== (item && item.payId) ? linked.get(e3.id) || null : null;
+    if (linkedTo) score -= 50;
+    out.push({ e: e3, sameDay, linkedTo, score });
+  }
+  return out.sort((a3, b3) => b3.score - a3.score || (a3.e.date < b3.e.date ? -1 : 1));
 }
 
 // src/views.js
@@ -5229,6 +5383,14 @@ function TripAdjust({ db, entries, trip, patch, flash, onClose }) {
   const isWelfare = (e3) => e3.transferKind === "welfare";
   const spend = all.filter((e3) => !isReimb(e3));
   const reimb = all.filter(isReimb);
+  const pc = T2(() => pairCancels(spend), [all, reimbIds]);
+  const [openPairs, setOpenPairs] = d2(() => /* @__PURE__ */ new Set());
+  const togglePair = (k3) => setOpenPairs((prev) => {
+    const n4 = new Set(prev);
+    if (n4.has(k3)) n4.delete(k3);
+    else n4.add(k3);
+    return n4;
+  });
   const [picks, setPicks] = d2(() => {
     const p3 = {};
     for (const e3 of all) p3[e3.id] = !!trip && e3.tripId === trip.id;
@@ -5299,7 +5461,7 @@ function TripAdjust({ db, entries, trip, patch, flash, onClose }) {
         ${isWelfare(e3) ? html`<span class="pickTag welfare"> 복지카드 · 합계 별도</span>` : ""}
         ${e3.currency && e3.currency !== "KRW" ? html`<span class="pickTag"> ${e3.currency}</span>` : ""}
       </span>
-      <span class=${"pickAmt" + (isReimb(e3) ? " reimb" : "")}>${isReimb(e3) ? "−" : ""}₩${formatWon(e3.amount)}</span>
+      <span class=${"pickAmt" + (isReimb(e3) ? " reimb" : e3.isRefund ? " refund" : "")}>${isReimb(e3) || e3.isRefund ? "−" : ""}₩${formatWon(e3.amount)}</span>
       ${!isReimb(e3) && html`
         <button class=${"soloTag" + (solo.has(e3.id) ? " on" : "")}
           onClick=${(ev) => {
@@ -5309,6 +5471,35 @@ function TripAdjust({ db, entries, trip, patch, flash, onClose }) {
   }}
           title="정산에서 빼고 나 혼자 쓴 것으로 봅니다">개인</button>`}
     </label>`;
+  const dateCell = (d3) => d3.slice(0, 4) === trip.startDate.slice(0, 4) ? html`<span class="pickDate">${d3.slice(5)}</span>` : html`<span class="pickDate long">${d3.slice(2).replace(/-/g, ".")}</span>`;
+  const pairRow = (g2) => {
+    const on = g2.ids.every((id) => picks[id]);
+    const open = openPairs.has(g2.key);
+    return html`
+      <div class="pairGroup" key=${"pair-" + g2.key}>
+        <label class=${"pickRow pairRow" + (on ? " on" : "")}>
+          <input type="checkbox" checked=${on}
+            onChange=${() => setPicks((p3) => {
+      const n4 = { ...p3 };
+      for (const id of g2.ids) n4[id] = !on;
+      return n4;
+    })} />
+          ${dateCell(g2.date)}
+          <span class="pickMemo">${g2.memo}<span class="pickTag"> 결제 후 취소 ${g2.pairs.length}쌍</span></span>
+          <span class="pickAmt">${g2.net < 0 ? "−" : ""}₩${formatWon(Math.abs(g2.net))}</span>
+          <button class="soloTag pairToggle" onClick=${(ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      togglePair(g2.key);
+    }}>${open ? "접기" : "펼치기"}</button>
+        </label>
+        ${open && html`<div class="pairItems">${g2.pairs.flat().sort((a3, b3) => a3.date < b3.date ? -1 : 1).map(row)}</div>`}
+      </div>`;
+  };
+  const spendList = [
+    ...spend.filter((e3) => !pc.pairedIds.has(e3.id)).map((e3) => ({ date: e3.date, e: e3 })),
+    ...pc.groups.map((g2) => ({ date: g2.date, g: g2 }))
+  ].sort((a3, b3) => a3.date < b3.date ? -1 : a3.date > b3.date ? 1 : 0);
   if (noDates) {
     return html`
       <div class="card">
@@ -5343,7 +5534,7 @@ function TripAdjust({ db, entries, trip, patch, flash, onClose }) {
       </div>
       <div class="pickList">
         ${spend.length === 0 && html`<div class="empty">조정할 항목이 없어요.<br />기간을 넓히거나 '여행 관련만 보기'를 눌러 모든 지출을 보세요.</div>`}
-        ${spend.map(row)}
+        ${spendList.map((x2) => x2.g ? pairRow(x2.g) : row(x2.e))}
         ${reimb.length > 0 && html`
           <div class="pickHead">받은 돈 — 같이 가는 사람이 보내준 정산금이면 체크 (여행 경비에서 빠져요)</div>
           ${reimb.map(row)}`}
@@ -6431,12 +6622,14 @@ function App() {
     setSync((s3) => ({ ...s3, state: "syncing" }));
     try {
       const r3 = await syncOnce(cur);
-      let pulled = 0;
+      let pulled = 0, resent = 0;
       setDb((prev) => {
         const out = applySync(prev, r3);
         pulled = out.pulled;
+        resent = out.resent || 0;
         return out.db;
       });
+      if (resent) setTimeout(() => runSyncRef.current && runSyncRef.current(false), 1500);
       try {
         const m3 = await syncMeta(cur);
         setDb((prev) => {
@@ -6456,6 +6649,10 @@ function App() {
       setTimeout(() => setToast(null), 2600);
     }
   }, []);
+  const runSyncRef = A2(null);
+  h2(() => {
+    runSyncRef.current = runSync;
+  }, [runSync]);
   h2(() => {
     runSync(false);
     const onVis = () => {
@@ -7528,6 +7725,7 @@ function TripView({ db, live, tripId, setTripId, rowProps, patch, flash, shareTe
   const [planOpen, setPlanOpen] = d2(false);
   const [planText, setPlanText] = d2("");
   const [editItem, setEditItem] = d2(null);
+  const [payOpen, setPayOpen] = d2(false);
   const [settleMode, setSettleMode] = d2(null);
   const planFileRef = A2(null);
   const [adding, setAdding] = d2(false);
@@ -7769,7 +7967,10 @@ function TripView({ db, live, tripId, setTripId, rowProps, patch, flash, shareTe
       if (nv) mk[id] = nv;
       else delete mk[id];
     });
-    const openEdit = (d3, it) => setEditItem(it ? { dayNo: d3.dayNo, id: it.id, time: it.endTime ? `${it.time}~${it.endTime}` : it.time, text: it.text, note: it.note || "", cost: it.cost ? String(it.cost) : "" } : { dayNo: d3.dayNo, id: null, time: "", text: "", note: "", cost: "" });
+    const openEdit = (d3, it) => {
+      setPayOpen(false);
+      setEditItem(it ? { dayNo: d3.dayNo, id: it.id, time: it.endTime ? `${it.time}~${it.endTime}` : it.time, text: it.text, note: it.note || "", cost: it.cost ? String(it.cost) : "", payId: it.payId || null } : { dayNo: d3.dayNo, id: null, time: "", text: "", note: "", cost: "", payId: null });
+    };
     const saveItem = () => {
       const ei = editItem;
       const tm = String(ei.time || "").match(/(\d{1,2}:\d{2})\s*(?:[~\-–]\s*(\d{1,2}:\d{2}))?/) || [];
@@ -7783,7 +7984,8 @@ function TripView({ db, live, tripId, setTripId, rowProps, patch, flash, shareTe
           text: ei.text.trim(),
           note: ei.note.trim(),
           cost: c3 == null ? null : c3,
-          kind: kindOf(`${ei.text} ${ei.note}`)
+          kind: kindOf(`${ei.text} ${ei.note}`),
+          payId: ei.payId || null
         };
         if (ei.id) d3.items = d3.items.map((x2) => x2.id === ei.id ? { ...x2, ...fields } : x2);
         else d3.items.push({ id: `${ei.dayNo}-n${Date.now().toString(36)}`, costNote: "", ...fields });
@@ -7854,13 +8056,22 @@ function TripView({ db, live, tripId, setTripId, rowProps, patch, flash, shareTe
       setTimeout(() => URL.revokeObjectURL(url), 5e3);
       flash("일정표 파일을 내려받았어요 — 카카오톡으로 보내세요");
     };
+    const linkedPays = /* @__PURE__ */ new Map();
+    for (const d3 of days) for (const it of d3.items) if (it.payId && (!editItem || it.id !== editItem.id)) linkedPays.set(it.payId, it.text);
+    const payCands = editItem && payOpen ? findPayments(
+      { ...editItem, cost: parseCostInput(editItem.cost, yenRate) },
+      days.find((x2) => x2.dayNo === editItem.dayNo),
+      live,
+      { tripId: t4.id, linked: linkedPays }
+    ) : [];
+    const linkedPay = editItem && editItem.payId ? live.find((e3) => e3.id === editItem.payId) : null;
     const Row = (d3, it) => html4`
           <div class=${"planItem mk-" + (marks[it.id] || "none")} key=${it.id}>
             <button class="planMark" title="다녀옴 · 취소 표시" onClick=${() => cycleMark(it.id)}>${marks[it.id] === "done" ? "✓" : marks[it.id] === "skip" ? "✗" : "○"}</button>
             <button class="planBody" onClick=${() => openEdit(d3, it)}>
               <span class="planTime">${it.time}</span>
               <span class="planText">${it.text}${it.note ? html4`<span class="planNote">${it.note.split("\n")[0]}</span>` : ""}</span>
-              ${it.cost ? html4`<span class="planCost">₩${formatWon2(it.cost)}</span>` : ""}
+              ${it.cost ? html4`<span class="planCost">₩${formatWon2(it.cost)}${it.payId ? html4`<span class="planPaid">실제</span>` : ""}</span>` : ""}
             </button>
           </div>`;
     return html4`
@@ -7916,6 +8127,28 @@ function TripView({ db, live, tripId, setTripId, rowProps, patch, flash, shareTe
                 <textarea class="pasteArea" style="min-height:64px" placeholder="메모 (동선·준비물 등, 안 적어도 됩니다)" value=${editItem.note}
                   onInput=${(e3) => setEditItem({ ...editItem, note: e3.target.value })}></textarea>
                 ${editItem.cost && parseCostInput(editItem.cost, yenRate) != null && /엔|円|¥|jpy/i.test(editItem.cost) ? html4`<div class="hint sm">₩${formatWon2(parseCostInput(editItem.cost, yenRate))} (1엔 = ${yenRate}원)</div>` : ""}
+                ${editItem.payId && html4`
+                  <div class="payLinked">
+                    <span>실제 결제: ${linkedPay ? `${linkedPay.date.slice(5)} ${linkedPay.memo} ₩${formatWon2(linkedPay.amount)}` : "연결된 결제"}</span>
+                    <button class="soloTag" onClick=${() => setEditItem({ ...editItem, payId: null })}>연결 풀기</button>
+                  </div>`}
+                <div class="row wrap" style="margin:4px 0">
+                  <button class="pickToggle" onClick=${() => setPayOpen((v3) => !v3)}>${payOpen ? "결제 목록 닫기" : "결제 찾기"}</button>
+                  <span class="hint sm">이 여행에 묶인 결제에서 골라 실제 금액을 넣어요</span>
+                </div>
+                ${payOpen && html4`
+                  <div class="payList">
+                    ${payCands.length === 0 ? html4`<div class="empty">이 여행에 묶인 결제가 없어요.<br />위의 <b>항목 조정</b>에서 먼저 넣으세요.</div>` : payCands.slice(0, 12).map((c3) => html4`
+                        <button class=${"payRow" + (c3.linkedTo ? " dim" : "")} key=${c3.e.id}
+                          onClick=${() => {
+      setEditItem({ ...editItem, cost: String(c3.e.amount), payId: c3.e.id });
+      setPayOpen(false);
+    }}>
+                          <span class="pickDate">${c3.e.date.slice(5)}</span>
+                          <span class="pickMemo">${c3.e.memo}${c3.sameDay ? html4`<span class="pickTag"> 같은 날</span>` : ""}${c3.linkedTo ? html4`<span class="pickTag"> 이미 연결: ${c3.linkedTo}</span>` : ""}</span>
+                          <span class="pickAmt">₩${formatWon2(c3.e.amount)}</span>
+                        </button>`)}
+                  </div>`}
                 <div class="acts">
                   ${editItem.id && html4`<button class="btn ghost sm" onClick=${removeItem}>일정 빼기</button>`}
                   <button class="btn ghost sm" onClick=${() => setEditItem(null)}>그만두기</button>
@@ -8337,7 +8570,7 @@ function Settings({ db, setDb, onClose, flash, onSync, onUndoImport, onOpenAccou
       ${db.settings.lastSyncAt && html4`<div class="hint sm">마지막 동기화 ${new Date(db.settings.lastSyncAt).toLocaleString("ko-KR")}</div>`}
 
       <div class="setDivider">데이터</div>
-      <div class="setStat">버전 <b>v36c</b> · 기록 ${db.entries.filter((e3) => !e3.deleted).length}건 · 분류 규칙 ${(db.categoryRules || []).length}개 · 보낼 것 ${db.entries.filter((e3) => e3.dirty).length}건 · 저장 용량 ${(size / 1024).toFixed(0)}KB</div>
+      <div class="setStat">버전 <b>v37</b> · 기록 ${db.entries.filter((e3) => !e3.deleted).length}건 · 분류 규칙 ${(db.categoryRules || []).length}개 · 보낼 것 ${db.entries.filter((e3) => e3.dirty).length}건 · 저장 용량 ${(size / 1024).toFixed(0)}KB</div>
 
       <div class="acts">
         <button class="btn ghost sm" onClick=${() => fileRef.current && fileRef.current.click()}>가져오기</button>
