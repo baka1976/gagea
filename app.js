@@ -3015,10 +3015,20 @@ function checkFile(rows, entries) {
   }
   return res;
 }
+function isTwCharge(e3) {
+  if (!e3 || e3.deleted || e3.paymentMethod !== "travelwallet" || e3.isRefund) return false;
+  if (e3.twKind) return e3.twKind === "topup";
+  if (e3.direction && e3.direction !== "in") return false;
+  if (e3.type === "expense") return false;
+  return /^트래블\s*월렛\s*충전/.test(String(e3.memo || "")) || /(^|\s)충전(\s|$)/.test(String(e3.rawText || ""));
+}
+function twChargeRepairs(entries) {
+  return (entries || []).filter((e3) => isTwCharge(e3) && e3.transferKind !== "fxTopup").map((e3) => e3.id);
+}
 function fxTopupTwins(entries, settings = {}) {
   const kws = (settings.travelKeywords && settings.travelKeywords.length ? settings.travelKeywords : ["트래블월렛", "트래블 월렛"]).map((k3) => String(k3).replace(/\s+/g, "")).filter(Boolean);
   const live = (entries || []).filter((e3) => !e3.deleted);
-  const charges = live.filter((e3) => e3.transferKind === "fxTopup" && e3.paymentMethod === "travelwallet");
+  const charges = live.filter(isTwCharge);
   if (!charges.length) return [];
   const bankSide = live.filter((e3) => e3.type === "expense" && !e3.transferKind && e3.direction !== "in" && e3.paymentMethod !== "travelwallet" && e3.catBy !== "user" && kws.some((k3) => String(e3.memo || "").replace(/\s+/g, "").includes(k3)));
   const dayDiff2 = (a3, b3) => Math.abs(/* @__PURE__ */ new Date(`${a3}T00:00:00`) - /* @__PURE__ */ new Date(`${b3}T00:00:00`)) / DAY;
@@ -3228,6 +3238,7 @@ function pairCancels(list) {
   }));
   return { groups, pairedIds: used };
 }
+var LATE_DAYS = 2;
 function buildTripCost(entries, trip, opts = {}) {
   if (!trip || !trip.startDate || !trip.endDate) {
     return { ...trip || {}, inside: [], booked: [], reimb: [], onsite: 0, prepaid: 0, total: 0, welfare: 0 };
@@ -3257,6 +3268,11 @@ function buildTripCost(entries, trip, opts = {}) {
     const tagged = welfare ? { ...e3, welfare: true } : e3;
     if (e3.date >= trip.startDate && e3.date <= trip.endDate) {
       inside.push(tagged);
+      continue;
+    }
+    const foreign = e3.currency && e3.currency !== "KRW";
+    if (foreign && e3.date > trip.endDate && e3.date <= shift(trip.endDate, LATE_DAYS) && !others.some((t4) => t4.startDate > trip.endDate && t4.startDate <= e3.date)) {
+      inside.push({ ...tagged, late: true });
       continue;
     }
     const before = e3.date >= pre && e3.date < trip.startDate;
@@ -4014,6 +4030,7 @@ function canReclassify(e3) {
   if (e3.memoBy === "user") return false;
   if (e3.mergedInto || e3.pairedFrom) return false;
   if (e3.transferKind === "external") return false;
+  if (e3.transferKind === "fxTopup" && e3.paymentMethod !== "travelwallet") return false;
   if (e3.source === "manual") return false;
   return !!String(e3.rawText || "").trim();
 }
@@ -4032,7 +4049,11 @@ function reclassifyOne(e3, opts = {}) {
   };
   let type = e3.type, category = e3.category, transferKind = e3.transferKind || null;
   let isExtra = !!e3.isExtra, familyBy = e3.familyBy || null;
-  if (base2.direction === "in") {
+  if (isTwCharge(e3)) {
+    type = "transfer";
+    transferKind = "fxTopup";
+    category = "etc";
+  } else if (base2.direction === "in") {
     const inc = classifyIncome(base2, st);
     if (inc) {
       type = inc.type;
@@ -5393,7 +5414,9 @@ function TripAdjust({ db, entries, trip, patch, flash, onClose }) {
   });
   const [picks, setPicks] = d2(() => {
     const p3 = {};
-    for (const e3 of all) p3[e3.id] = !!trip && e3.tripId === trip.id;
+    const fresh = !!trip && !current.length;
+    const sure = new Set(fresh ? [...cost.inside, ...cost.booked.filter((e3) => e3.sure && e3.when === "pre")].map((e3) => e3.id) : []);
+    for (const e3 of all) p3[e3.id] = !!trip && (e3.tripId === trip.id || sure.has(e3.id));
     return p3;
   });
   const [solo, setSolo] = d2(() => new Set(trip && trip.soloIds || []));
@@ -5511,6 +5534,7 @@ function TripAdjust({ db, entries, trip, patch, flash, onClose }) {
   return html`
     <div class="card">
       <div class="cardLabel">${trip.name} · 항목 조정</div>
+      ${!current.length && n3 > 0 && html`<div class="hint sm"><b>처음 묶는 여행이라 여행 결제로 보이는 ${n3}건을 미리 체크했어요.</b> 맞으면 저장만 누르세요.</div>`}
       <div class="hint sm">여행 기간 안팎의 결제를 모아 보여줍니다. 왼쪽 체크로 여행에 넣고 빼세요. 오른쪽 <b>개인</b>은 나 혼자 쓴 돈이라 정산에서 빠집니다.${future ? " 아직 안 떠난 여행이라 1년 앞까지 찾습니다." : ""}</div>
       <div class="row wrap" style="margin-top:8px">
         ${RANGES.map((r3) => html`
@@ -6701,7 +6725,7 @@ function App() {
   });
   const live = T2(() => db.entries.filter((e3) => !e3.deleted), [db.entries]);
   h2(() => {
-    const ids = fxTopupTwins(db.entries, db.settings);
+    const ids = [...twChargeRepairs(db.entries), ...fxTopupTwins(db.entries, db.settings)];
     if (!ids.length) return;
     const set = new Set(ids);
     const now = Date.now();
@@ -8570,7 +8594,7 @@ function Settings({ db, setDb, onClose, flash, onSync, onUndoImport, onOpenAccou
       ${db.settings.lastSyncAt && html4`<div class="hint sm">마지막 동기화 ${new Date(db.settings.lastSyncAt).toLocaleString("ko-KR")}</div>`}
 
       <div class="setDivider">데이터</div>
-      <div class="setStat">버전 <b>v37</b> · 기록 ${db.entries.filter((e3) => !e3.deleted).length}건 · 분류 규칙 ${(db.categoryRules || []).length}개 · 보낼 것 ${db.entries.filter((e3) => e3.dirty).length}건 · 저장 용량 ${(size / 1024).toFixed(0)}KB</div>
+      <div class="setStat">버전 <b>v38</b> · 기록 ${db.entries.filter((e3) => !e3.deleted).length}건 · 분류 규칙 ${(db.categoryRules || []).length}개 · 보낼 것 ${db.entries.filter((e3) => e3.dirty).length}건 · 저장 용량 ${(size / 1024).toFixed(0)}KB</div>
 
       <div class="acts">
         <button class="btn ghost sm" onClick=${() => fileRef.current && fileRef.current.click()}>가져오기</button>
