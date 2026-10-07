@@ -462,6 +462,7 @@ __export(engine_exports, {
   matchByAmount: () => matchByAmount,
   matchRule: () => matchRule,
   matchScore: () => matchScore,
+  nonPaymentReason: () => nonPaymentReason,
   normKey: () => normKey,
   parseBankSms: () => parseBankSms,
   parseCardSms: () => parseCardSms,
@@ -1278,6 +1279,27 @@ function applyAccountRules(entry, settings) {
   }
   return null;
 }
+var REPAY = /(상환|이자|출금|납부|수수료)/;
+var NON_PAYMENT = [
+  ["거절", /거절/, false],
+  ["카드론", /카드론|장기카드대출/, true],
+  ["현금서비스", /현금서비스|단기카드대출/, true],
+  ["대출", /대출\s*(신청|승인|실행|한도|가능|안내)/, true],
+  ["발급", /발급/, true],
+  ["결제예정", /(결제|청구|출금)\s*예정/, false],
+  ["광고", /\(광고\)|\[광고\]/, false],
+  ["이벤트", /이벤트|응모/, false],
+  ["캐시백", /캐시백/, false]
+];
+function nonPaymentReason(raw) {
+  const t4 = String(raw == null ? "" : raw);
+  for (const [why, re, unlessRepay] of NON_PAYMENT) {
+    if (!re.test(t4)) continue;
+    if (unlessRepay && REPAY.test(t4.replace(/대출금/g, ""))) continue;
+    return why;
+  }
+  return null;
+}
 function detectSmsKind(raw, settings) {
   const t4 = String(raw == null ? "" : raw).replace(/\s/g, "");
   const tagged = /\[(?!web발신|국외발신|국제발신|광고)[^\[\]]{2,12}\](승인|취소|승인취소)/i.test(t4);
@@ -1464,7 +1486,9 @@ function parseFree(text, opts = {}) {
 function parseOne(text, opts = {}) {
   const kind = detectSmsKind(text, opts.settings);
   const parsed = kind === "card" ? parseCardSms(text, opts) : kind === "bank" ? parseBankSms(text, opts) : kind === "receipt" ? parseReceipt(text, opts) : parseFree(text, opts);
-  return finishMemo(parsed, opts);
+  const out = finishMemo(parsed, opts);
+  const why = nonPaymentReason(text);
+  return why && out ? { ...out, nonPayment: why } : out;
 }
 var BILL_RE = /(이용상세내역|청구서|청구금액|납부할\s*금액|총\s*납부하실\s*금액|납부금액)/;
 var BILL_AMT = /(청구금액|납부할\s*금액|총\s*납부하실\s*금액|납부금액)\D{0,8}([0-9][0-9,]*)/;
@@ -1638,6 +1662,7 @@ var SOURCE_RANK = { statement: 4, sms: 3, shortcut: 3, receipt: 2, capture: 2, m
 function matchScore(a3, b3) {
   if (a3.amount !== b3.amount) return 0;
   if (a3.type !== b3.type) return 0;
+  if (!!a3.isRefund !== !!b3.isRefund) return 0;
   if (a3.direction && b3.direction && a3.direction !== b3.direction) return 0;
   if (a3.accountId && b3.accountId && a3.accountId !== b3.accountId) return 0;
   const da = /* @__PURE__ */ new Date(a3.date + "T00:00:00"), db = /* @__PURE__ */ new Date(b3.date + "T00:00:00");
@@ -2935,10 +2960,10 @@ function csvToEntries(rows, map, opts = {}) {
 }
 function entryKey(e3) {
   if (!e3 || !e3.date || !e3.amount) return "";
-  if (e3.dedupKey) return e3.dedupKey;
   const k3 = e3.normKey || normKey(e3.memo);
   const dir = e3.direction || (e3.type === "income" ? "in" : "out");
-  return `${e3.date}|${e3.amount}|${k3}|${dir}`;
+  const base2 = e3.dedupKey || `${e3.date}|${e3.amount}|${k3}|${dir}`;
+  return e3.isRefund ? `${base2}|R` : base2;
 }
 function sameAccount(a3, b3) {
   const x2 = a3 && a3.accountId, y3 = b3 && b3.accountId;
@@ -3239,6 +3264,61 @@ function pairCancels(list) {
   return { groups, pairedIds: used };
 }
 var LATE_DAYS = 2;
+var dayGap = (a3, b3) => Math.abs(/* @__PURE__ */ new Date(`${a3}T00:00:00`) - /* @__PURE__ */ new Date(`${b3}T00:00:00`)) / DAY;
+function orphanCancels(entries) {
+  const live = (entries || []).filter((e3) => e3 && !e3.deleted);
+  const pays = live.filter((e3) => !e3.isRefund && e3.type === "expense");
+  const key = (e3) => e3.normKey || normKey(e3.memo);
+  return live.filter((c3) => c3.isRefund && c3.type === "expense" && !c3.transferKind && c3.catBy !== "user" && !c3.excludedBy && /승인\s*취소/.test(String(c3.rawText || "")) && !pays.some((p3) => key(p3) === key(c3) && p3.amount >= c3.amount && p3.date <= c3.date && dayGap(p3.date, c3.date) <= 31));
+}
+function cancelPairMap(entries) {
+  const map = /* @__PURE__ */ new Map();
+  const live = (entries || []).filter((e3) => e3 && !e3.deleted);
+  for (const g2 of pairCancels(live).groups) {
+    for (const [p3, c3] of g2.pairs) {
+      map.set(p3.id, { role: "pay", partner: c3.id, payDate: p3.date });
+      map.set(c3.id, { role: "cancel", partner: p3.id, payDate: p3.date });
+    }
+  }
+  return map;
+}
+function forTotals(entries) {
+  const live = (entries || []).filter((e3) => e3 && !e3.deleted);
+  const orphan = new Set(orphanCancels(live).map((e3) => e3.id));
+  const pm = cancelPairMap(live);
+  const out = [];
+  for (const e3 of live) {
+    if (e3.status === "pending" || orphan.has(e3.id)) continue;
+    const p3 = pm.get(e3.id);
+    out.push(p3 && p3.role === "cancel" && p3.payDate !== e3.date ? { ...e3, date: p3.payDate, movedFrom: e3.date } : e3);
+  }
+  return out;
+}
+var BIG_AMOUNT = 1e6;
+function monthChecks(all, range, opts = {}) {
+  const live = (all || []).filter((e3) => e3 && !e3.deleted);
+  const inR = (e3) => e3.date >= range.start && e3.date <= range.end;
+  const spend = (e3) => e3.type === "expense" && !e3.transferKind && !e3.isRefund;
+  const uncat = live.filter((e3) => inR(e3) && spend(e3) && e3.category === "etc" && e3.catBy !== "user" && e3.status !== "pending");
+  const orphans = orphanCancels(live).filter(inR);
+  const big = live.filter((e3) => inR(e3) && spend(e3) && e3.amount >= (opts.bigAmount || BIG_AMOUNT) && e3.category !== "family" && !e3.fixedId && e3.catBy !== "user" && e3.status !== "pending");
+  const unbound = [];
+  const trips = (opts.trips || []).filter((t4) => t4.startDate && t4.endDate && t4.startDate <= range.end && t4.endDate >= range.start);
+  for (const t4 of trips) {
+    const c3 = buildTripCost(live, t4, { allTrips: opts.trips, preDays: 0, settings: opts.settings });
+    const list = c3.inside.filter((e3) => !e3.tripId && inR(e3) && !e3.welfare);
+    if (list.length) unbound.push({ trip: t4, entries: list });
+  }
+  const pending = live.filter((e3) => inR(e3) && e3.status === "pending");
+  return {
+    uncat,
+    orphans,
+    big,
+    unbound,
+    pending,
+    count: (uncat.length ? 1 : 0) + orphans.length + big.length + unbound.length + (pending.length ? 1 : 0)
+  };
+}
 function buildTripCost(entries, trip, opts = {}) {
   if (!trip || !trip.startDate || !trip.endDate) {
     return { ...trip || {}, inside: [], booked: [], reimb: [], onsite: 0, prepaid: 0, total: 0, welfare: 0 };
@@ -5684,6 +5764,59 @@ function QuotePanel({ db, carId, patch, flash, onClose, onAddEntry }) {
       </div>
     </div>`;
 }
+function MonthChecks({ checks, trips, onUpdate, onBind, onOpenReview, onOpenInbox }) {
+  const [open, setOpen] = d2(false);
+  if (!checks || !checks.count) return "";
+  const { uncat, orphans, big, unbound, pending } = checks;
+  const sum = (list) => list.reduce((s3, e3) => s3 + e3.amount, 0);
+  const md2 = (d3) => `${parseInt(d3.slice(5, 7), 10)}/${parseInt(d3.slice(8), 10)}`;
+  return html`
+    <div class=${"checkCard" + (open ? " open" : "")}>
+      <button class="checkHead" onClick=${() => setOpen((v3) => !v3)}>
+        이번 달 확인할 것 <b>${checks.count}</b>
+        <span class="checkCaret">${open ? "▴" : "▾"}</span>
+      </button>
+      ${open && html`
+        <div class="checkBody">
+          ${orphans.map((e3) => html`
+            <div class="checkItem" key=${"o" + e3.id}>
+              <div class="checkTop"><span>${md2(e3.date)} ${e3.memo}</span><span class="checkAmt">−₩${formatWon(e3.amount)}</span></div>
+              <div class="checkWhy">원래 승인이 명세서에 없는 승인취소예요. 주유소 가승인처럼 승인했다 바로 취소한 것이면 지출에 영향이 없어요. <b>답할 때까지 합계에서 뺐어요.</b></div>
+              <div class="chips">
+                <button class="chip sm" onClick=${() => onUpdate(e3.id, { type: "transfer", transferKind: "excluded", excludedBy: "승인취소 (원래 승인 없음)", status: "confirmed" })}>승인만 취소된 것</button>
+                <button class="chip sm dash" onClick=${() => onUpdate(e3.id, { catBy: "user", status: "confirmed" })}>환불 맞음</button>
+              </div>
+            </div>`)}
+          ${big.map((e3) => html`
+            <div class="checkItem" key=${"b" + e3.id}>
+              <div class="checkTop"><span>${md2(e3.date)} ${e3.memo}</span><span class="checkAmt">₩${formatWon(e3.amount)}</span></div>
+              <div class="checkWhy">큰 금액이에요. 쓴 돈이 맞나요? 보증금·목돈 이체처럼 지출이 아니면 합계에서 뺄게요.</div>
+              <div class="chips">
+                <button class="chip sm" onClick=${() => onUpdate(e3.id, { catBy: "user", status: "confirmed" })}>쓴 돈 맞음</button>
+                <button class="chip sm dash" onClick=${() => onUpdate(e3.id, { type: "transfer", transferKind: "excluded", excludedBy: "큰 금액 — 지출 아님", catBy: "user", status: "confirmed" })}>지출 아님</button>
+              </div>
+            </div>`)}
+          ${unbound.map((u3) => html`
+            <div class="checkItem" key=${"t" + u3.trip.id}>
+              <div class="checkTop"><span>${u3.trip.name} 기간 결제 ${u3.entries.length}건</span><span class="checkAmt">₩${formatWon(sum(u3.entries))}</span></div>
+              <div class="checkWhy">여행 기간 안인데 여행에 묶이지 않았어요.</div>
+              <div class="chips"><button class="chip sm" onClick=${() => onBind(u3.trip.id, u3.entries.map((e3) => e3.id))}>${u3.trip.name}에 묶기</button></div>
+            </div>`)}
+          ${uncat.length > 0 && html`
+            <div class="checkItem">
+              <div class="checkTop"><span>분류 못 한 지출 ${uncat.length}건</span><span class="checkAmt">₩${formatWon(sum(uncat))}</span></div>
+              <div class="checkWhy">한 번 정해 주면 같은 가게는 다음부터 저절로 분류돼요.</div>
+              <div class="chips"><button class="chip sm" onClick=${onOpenReview}>분류 정리 열기</button></div>
+            </div>`}
+          ${pending.length > 0 && html`
+            <div class="checkItem">
+              <div class="checkTop"><span>확인 안 된 기록 ${pending.length}건</span><span class="checkAmt">₩${formatWon(sum(pending))}</span></div>
+              <div class="checkWhy">확인하기 전까지는 합계에 넣지 않아요.</div>
+              <div class="chips"><button class="chip sm" onClick=${onOpenInbox}>확인하러 가기</button></div>
+            </div>`}
+        </div>`}
+    </div>`;
+}
 
 // src/stats.js
 var html2 = htm_module_default.bind(k);
@@ -6172,10 +6305,34 @@ function restoreSettingsFrom(d3, backup) {
     favorites: pick("favorites")
   };
   const trips = [...d3.trips || []];
-  for (const t4 of backup.trips || []) if (t4 && t4.id && !trips.some((x2) => x2.id === t4.id)) trips.push(t4);
+  let tripsReplaced = 0;
+  for (const t4 of backup.trips || []) {
+    if (!t4 || !t4.id) continue;
+    const i3 = trips.findIndex((x2) => x2.id === t4.id);
+    if (i3 < 0) trips.push(t4);
+    else if ((t4.updatedAt || 0) > (trips[i3].updatedAt || 0)) {
+      trips[i3] = { ...trips[i3], ...t4 };
+      tripsReplaced++;
+    }
+  }
   next.trips = trips;
-  const summary = `분류 규칙 ${next.categoryRules.length}개, 계좌 ${next.accounts.length}개, 고정비 ${next.fixedExpenses.length}개, 여행 ${trips.length}개와 설정을 되살립니다.`;
-  return { db: next, summary };
+  const PATCHABLE = ["tripId", "type", "category", "transferKind", "excludedBy", "catBy", "status"];
+  const patches = new Map((Array.isArray(backup.entryPatches) ? backup.entryPatches : []).filter((p3) => p3 && p3.id).map((p3) => [p3.id, p3]));
+  let patched = 0;
+  if (patches.size) {
+    const now = Date.now();
+    next.entries = (d3.entries || []).map((e3) => {
+      const p3 = patches.get(e3.id);
+      if (!p3 || e3.deleted) return e3;
+      const fix = {};
+      for (const k3 of PATCHABLE) if (k3 in p3 && p3[k3] !== e3[k3]) fix[k3] = p3[k3];
+      if (!Object.keys(fix).length) return e3;
+      patched++;
+      return { ...e3, ...fix, updatedAt: now, dirty: true };
+    });
+  }
+  const summary = `분류 규칙 ${next.categoryRules.length}개, 계좌 ${next.accounts.length}개, 고정비 ${next.fixedExpenses.length}개, 여행 ${trips.length}개와 설정을 되살립니다.` + (tripsReplaced ? ` 여행 ${tripsReplaced}개는 파일의 새 일정으로 바꿉니다.` : "") + (patched ? ` 기록 ${patched}건을 고칩니다.` : "");
+  return { db: next, summary, patched };
 }
 function wipeEntries(d3) {
   return { ...EMPTY_DB, ...d3, entries: [], imports: [], settings: { ...EMPTY_DB.settings, ...d3.settings || {}, lastSyncAt: "" } };
@@ -6583,7 +6740,25 @@ function EntryRow({ entry, trips, vehicles, onQuickCat, onEdit, onDelete, select
         </div>`}
     </div>`;
 }
-function DateGroups({ list, ...rest }) {
+function PairRow({ pay, cancel, rest }) {
+  const [open, setOpen] = d2(false);
+  return html4`
+    <div class="pairWrap">
+      <button class="entry pairLine" onClick=${() => setOpen((v3) => !v3)}>
+        <span class="dot" style="background:#bbb"></span>
+        <div class="entryMain">
+          <div class="entryCat">결제 후 취소<span class="refund"> · ${open ? "접기" : "펼치기"}</span></div>
+          <div class="entryMemo">${pay.memo || "-"}</div>
+        </div>
+        <div class="entryAmt"><div class="amtNum">₩${formatWon2(Math.abs(pay.amount - cancel.amount))}</div></div>
+      </button>
+      ${open && html4`<div class="pairItems">
+        <${EntryRow} entry=${pay} ...${rest} />
+        <${EntryRow} entry=${cancel} ...${rest} />
+      </div>`}
+    </div>`;
+}
+function DateGroups({ list, pairs, ...rest }) {
   const groups = T2(() => {
     const map = /* @__PURE__ */ new Map();
     for (const e3 of list) {
@@ -6592,10 +6767,29 @@ function DateGroups({ list, ...rest }) {
     }
     return Array.from(map.entries());
   }, [list]);
+  const rowsOf = (items) => {
+    if (!pairs || rest.selecting) return items.map((e3) => ({ e: e3 }));
+    const here = new Map(items.map((e3) => [e3.id, e3]));
+    const used = /* @__PURE__ */ new Set(), out = [];
+    for (const e3 of items) {
+      if (used.has(e3.id)) continue;
+      const p3 = pairs.get(e3.id);
+      const other = p3 && here.get(p3.partner);
+      if (other && !used.has(other.id)) {
+        used.add(e3.id);
+        used.add(other.id);
+        out.push(p3.role === "pay" ? { pay: e3, cancel: other } : { pay: other, cancel: e3 });
+      } else {
+        used.add(e3.id);
+        out.push({ e: e3 });
+      }
+    }
+    return out;
+  };
   return html4`${groups.map(([date, items]) => html4`
     <div class="group" key=${date}>
       <div class="groupHead">${formatDateLabel2(date)}</div>
-      ${items.map((e3) => html4`<${EntryRow} key=${e3.id} entry=${e3} ...${rest} checked=${rest.selectedIds ? rest.selectedIds.includes(e3.id) : false} />`)}
+      ${rowsOf(items).map((r3) => r3.e ? html4`<${EntryRow} key=${r3.e.id} entry=${r3.e} ...${rest} checked=${rest.selectedIds ? rest.selectedIds.includes(r3.e.id) : false} />` : html4`<${PairRow} key=${"pair-" + r3.pay.id} pay=${r3.pay} cancel=${r3.cancel} rest=${rest} />`)}
     </div>`)}`;
 }
 function App() {
@@ -7091,7 +7285,7 @@ function App() {
     const res = parsePaste2(text, { rules: db.categoryRules, settings: db.settings });
     if (res.mode === "multi") {
       const rec = reconcile2(res.entries, live);
-      setMulti({ ...res, ...rec, picked: rec.added.map(() => true) });
+      setMulti({ ...res, ...rec, picked: rec.added.map((e3) => !e3.nonPayment) });
       setDraft(null);
     } else {
       setDraft(makeEntry(res.entries[0]));
@@ -7154,9 +7348,13 @@ function App() {
     () => live.filter((e3) => e3.date >= range.start && e3.date <= range.end).sort((a3, b3) => a3.date < b3.date ? 1 : a3.date > b3.date ? -1 : b3.createdAt - a3.createdAt),
     [live, range]
   );
+  const forSum = T2(() => forTotals(live), [live]);
+  const inRangeSum = T2(() => forSum.filter((e3) => e3.date >= range.start && e3.date <= range.end), [forSum, range]);
+  const checks = T2(() => monthChecks(live, range, { trips: db.trips, settings: db.settings }), [live, range, db.trips, db.settings]);
+  const held = checks.pending.length + checks.orphans.length;
   const axes = T2(() => {
     let variable = 0, fixed = 0, family = 0, familyExtra = 0, travel = 0, cash = 0, income = 0, welfare2 = 0;
-    for (const e3 of inRange) {
+    for (const e3 of inRangeSum) {
       if (e3.type === "income") {
         income += e3.amount;
         continue;
@@ -7187,8 +7385,9 @@ function App() {
       income,
       expense: variable + fixed + family + familyExtra + travel + cash
     };
-  }, [inRange]);
+  }, [inRangeSum]);
   const inbox = T2(() => live.filter((e3) => e3.status === "pending"), [live]);
+  const pairMap = T2(() => cancelPairMap(live), [live]);
   const autoPlan = T2(() => {
     if (!inbox.length) return [];
     const opts = { settings: db.settings, rules: db.categoryRules || [] };
@@ -7390,7 +7589,7 @@ function App() {
             <button class=${"sumTab" + (showChart === "report" ? " on" : "")} onClick=${() => setShowChart("report")}>결산</button>
           </div>
 
-          ${showChart === "report" ? html4`<${ReportView} all=${live} monthStartDay=${db.settings.monthStartDay} />` : showChart === "chart" ? html4`<${StatsView} entries=${inRange} all=${live} />` : html4`
+          ${showChart === "report" ? html4`<${ReportView} all=${forSum} monthStartDay=${db.settings.monthStartDay} />` : showChart === "chart" ? html4`<${StatsView} entries=${inRangeSum} all=${forSum} />` : html4`
           <div class="axes">
             ${[
     ["변동비", axes.variable],
@@ -7408,6 +7607,7 @@ function App() {
               <span class="axisLabel">지출 합계</span>
               <span class="axisVal">₩${formatWon2(axes.expense)}</span>
             </div>
+            ${held > 0 && html4`<div class="axisHeld">확인 안 된 ${held}건은 합계에 아직 안 넣었어요</div>`}
             ${(axes.welfare > 0 || welfare.used > 0) && html4`
               <div class="axis welfare">
                 <span class="axisLabel">복지카드 <span class="axisNote">합계 제외</span></span>
@@ -7502,6 +7702,7 @@ function App() {
       ${draft && html4`
         <div class="card">
           <div class="cardLabel">아래 내용으로 기록할게요</div>
+          ${draft.nonPayment && html4`<div class="warn"><${IcoAlert} size=${13} /> 결제 문자가 아닌 것 같아요 ('${draft.nonPayment}'). 돈이 나간 게 아니면 <b>그만두기</b>를 누르세요.</div>`}
           ${dup && html4`<div class="warn"><${IcoAlert} size=${13} /> ${formatDateLabel2(dup.date)}에 같은 금액(₩${formatWon2(dup.amount)}) 내역이 이미 있어요 — ${dup.memo || "메모 없음"}</div>`}
           <${EntryForm} value=${draft} onChange=${setDraft} onSave=${commitDraft} onCancel=${() => setDraft(null)}
             saveLabel="기록하기" trips=${db.trips} vehicles=${db.vehicles} onCreateTrip=${addTrip} onCreateVehicle=${addVehicle} />
@@ -7676,6 +7877,20 @@ function App() {
               </div>
               <${DateGroups} list=${searchHits} ...${rowProps} />`}
           </div>` : tab === "month" ? html4`
+          <${MonthChecks} checks=${checks} trips=${db.trips}
+            onUpdate=${(id, p3) => {
+    updateEntry(id, p3);
+    flash("반영했어요");
+  }}
+            onBind=${(tid, ids) => {
+    const set = new Set(ids);
+    schedulePush();
+    patch((n3) => {
+      n3.entries = n3.entries.map((e3) => set.has(e3.id) ? { ...e3, tripId: tid, updatedAt: Date.now(), dirty: true } : e3);
+    });
+    flash(`${ids.length}건을 여행에 묶었어요`);
+  }}
+            onOpenReview=${() => setPanel("review")} onOpenInbox=${() => setInboxOpen(true)} />
           <${FixedView} db=${db} patch=${patch} entries=${live} flash=${flash} onAdopt=${adoptFixed} />
 
           ${inRange.length === 0 ? html4`
@@ -7696,7 +7911,7 @@ function App() {
                       ${sel.ids.length === inRange.length ? "전체 해제" : "전체 고르기"}</button>` : html4`<button class="linkBtn" onClick=${() => setSel({ on: true, ids: [] })}>고르기</button>`}
               </div>
               ${addOpen && pasteBox}
-              <${DateGroups} list=${inRange} ...${rowProps} />`}` : tab === "asset" ? html4`<${AssetView} db=${db} entries=${live} patch=${patch} rowProps=${rowProps} />` : tab === "trip" ? html4`
+              <${DateGroups} list=${inRange} pairs=${pairMap} ...${rowProps} />`}` : tab === "asset" ? html4`<${AssetView} db=${db} entries=${live} patch=${patch} rowProps=${rowProps} />` : tab === "trip" ? html4`
           <div class="toolRow">
             <button class="toolBtn" onClick=${() => setPanel(panel === "tripFind" ? null : "tripFind")}>여행 자동 찾기</button>
             ${tripId && html4`<button class="toolBtn" onClick=${() => setPanel(panel === "tripAdj" ? null : "tripAdj")}>항목 조정</button>`}
@@ -8462,7 +8677,7 @@ function Settings({ db, setDb, onClose, flash, onSync, onUndoImport, onOpenAccou
         const parsed = JSON.parse(r3.result);
         const out = restoreSettingsFrom(db, parsed);
         if (!window.confirm(`${out.summary}
-거래 기록은 건드리지 않아요. 되살릴까요?`)) return;
+${out.patched ? "거래 금액은 건드리지 않아요." : "거래 기록은 건드리지 않아요."} 되살릴까요?`)) return;
         setDb(out.db);
         flash("설정을 되살렸어요 · 다음 동기화 때 시트에도 올라가요");
         onClose();
@@ -8594,7 +8809,7 @@ function Settings({ db, setDb, onClose, flash, onSync, onUndoImport, onOpenAccou
       ${db.settings.lastSyncAt && html4`<div class="hint sm">마지막 동기화 ${new Date(db.settings.lastSyncAt).toLocaleString("ko-KR")}</div>`}
 
       <div class="setDivider">데이터</div>
-      <div class="setStat">버전 <b>v38</b> · 기록 ${db.entries.filter((e3) => !e3.deleted).length}건 · 분류 규칙 ${(db.categoryRules || []).length}개 · 보낼 것 ${db.entries.filter((e3) => e3.dirty).length}건 · 저장 용량 ${(size / 1024).toFixed(0)}KB</div>
+      <div class="setStat">버전 <b>v39</b> · 기록 ${db.entries.filter((e3) => !e3.deleted).length}건 · 분류 규칙 ${(db.categoryRules || []).length}개 · 보낼 것 ${db.entries.filter((e3) => e3.dirty).length}건 · 저장 용량 ${(size / 1024).toFixed(0)}KB</div>
 
       <div class="acts">
         <button class="btn ghost sm" onClick=${() => fileRef.current && fileRef.current.click()}>가져오기</button>

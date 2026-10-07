@@ -557,6 +557,19 @@ button { cursor: pointer; }
 .payRow .pickMemo { flex: 1; }
 .payRow.dim { opacity: 0.55; }
 .payLinked { font-size: 11.5px; color: var(--ink-soft); margin: 4px 0; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+/* v39 — 이번 달 확인할 것 · 결제 후 취소 짝 · 합계에서 뺀 것 */
+.checkCard { background: #F7EFDC; border: 1px solid #D9BE84; border-left: 3px solid var(--seal); border-radius: 8px; padding: 10px 12px; margin: 0 0 12px; }
+.checkHead { display: flex; align-items: center; gap: 6px; width: 100%; background: none; border: none; padding: 0; font-family: 'Nanum Myeongjo', serif; font-size: 14px; font-weight: 700; color: var(--ink); text-align: left; }
+.checkHead b { color: var(--seal); }
+.checkCaret { margin-left: auto; font-size: 12px; color: var(--ink-soft); }
+.checkBody { margin-top: 8px; }
+.checkItem { padding: 9px 0; border-top: 1px dashed var(--paper-line); }
+.checkTop { display: flex; justify-content: space-between; gap: 8px; font-size: 13px; font-weight: 600; }
+.checkAmt { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.checkWhy { font-size: 12px; color: var(--ink-soft); margin: 3px 0 6px; line-height: 1.5; }
+.axisHeld { font-size: 11.5px; color: var(--ink-soft); text-align: right; margin-top: 4px; }
+.pairLine { width: 100%; background: none; border: none; font-family: inherit; text-align: left; color: var(--ink); opacity: 0.75; }
+.pairWrap .pairItems { margin-left: 14px; }
 .pickDate.long { width: 52px; }
 .bulkBar ~ .toast { bottom: calc(104px + env(safe-area-inset-bottom)); }
 .tripDates .row { margin-top: 8px; }
