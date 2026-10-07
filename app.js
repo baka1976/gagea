@@ -1936,6 +1936,30 @@ function stamp(text) {
   for (let i3 = 0; i3 < text.length; i3++) h3 = (h3 << 5) - h3 + text.charCodeAt(i3) | 0;
   return String(h3);
 }
+var TIME_KEYS = ["updatedAt", "marksAt"];
+function stableText(v3) {
+  if (Array.isArray(v3)) return `[${v3.map(stableText).join(",")}]`;
+  if (v3 && typeof v3 === "object") {
+    return `{${Object.keys(v3).filter((k3) => v3[k3] !== void 0).sort().map((k3) => `${JSON.stringify(k3)}:${stableText(v3[k3])}`).join(",")}}`;
+  }
+  return JSON.stringify(v3 === void 0 ? null : v3);
+}
+function strip(o3, keys) {
+  const out = { ...o3 || {} };
+  for (const k3 of keys) delete out[k3];
+  return out;
+}
+function tripPieces(t4) {
+  const { plan, ...rest } = t4;
+  const out = [[`trip:${t4.id}`, strip(rest, TIME_KEYS)]];
+  if (plan) {
+    const { marks, ...planRest } = plan;
+    out.push([`plan:${t4.id}`, strip(planRest, TIME_KEYS)]);
+    if (marks && Object.keys(marks).length) out.push([`marks:${t4.id}`, marks]);
+  }
+  return out;
+}
+var tripStamp = (v3) => stamp(stableText(v3));
 function metaRowsFrom(db) {
   const now = Date.now();
   const sent = { ...(db.settings || {}).metaSent || {} };
@@ -1954,13 +1978,18 @@ function metaRowsFrom(db) {
   push("rules", db.categoryRules || []);
   push("accounts", db.accounts || []);
   push("fixed", db.fixedExpenses || []);
+  const firstV39a = !sent.__v39a;
+  sent.__v39a = true;
   for (const t4 of db.trips || []) {
-    const { plan, ...rest } = t4;
-    push(`trip:${t4.id}`, rest);
-    if (plan) {
-      const { marks, ...planRest } = plan;
-      push(`plan:${t4.id}`, planRest);
-      if (marks && Object.keys(marks).length) push(`marks:${t4.id}`, marks);
+    const localAt = { trip: t4.updatedAt || 0, plan: t4.plan && t4.plan.updatedAt || 0, marks: t4.plan && t4.plan.marksAt || 0 };
+    for (const [key, value] of tripPieces(t4)) {
+      const h3 = tripStamp(value);
+      const was = sent[key];
+      let at;
+      if (firstV39a) at = Math.max(was && was.at || 0, localAt[key.split(":")[0]] || 0);
+      else at = was && was.h === h3 ? was.at : now;
+      sent[key] = { h: h3, at };
+      rows.push({ key, value: JSON.stringify(value), updatedAt: at });
     }
   }
   return { rows, sent };
@@ -2011,12 +2040,16 @@ function applyMeta(db, rows) {
     const [, kind, id] = m3;
     const i3 = next.trips.findIndex((t4) => t4.id === id);
     const cur = i3 >= 0 ? next.trips[i3] : null;
+    const mark = () => {
+      sent[r3.key] = { h: tripStamp(kind === "marks" ? v3 : strip(v3, TIME_KEYS)), at };
+    };
     if (kind === "trip") {
       if (cur && at <= (cur.updatedAt || 0)) continue;
       const merged = { ...cur || {}, ...v3, updatedAt: at };
       if (cur && cur.plan) merged.plan = cur.plan;
       if (i3 >= 0) next.trips[i3] = merged;
       else next.trips.push(merged);
+      mark();
       changed++;
       continue;
     }
@@ -2024,12 +2057,14 @@ function applyMeta(db, rows) {
     if (kind === "plan") {
       if (at <= (cur.plan && cur.plan.updatedAt || 0)) continue;
       next.trips[i3] = { ...cur, plan: { ...cur.plan || {}, ...v3, updatedAt: at } };
+      mark();
       changed++;
       continue;
     }
     const mine = cur.plan && cur.plan.marks || {};
     if (at <= (cur.plan && cur.plan.marksAt || 0)) continue;
     next.trips[i3] = { ...cur, plan: { ...cur.plan || {}, marks: { ...mine, ...v3 }, marksAt: at } };
+    mark();
     changed++;
   }
   return { db: next, changed, sent };
@@ -5783,7 +5818,7 @@ function MonthChecks({ checks, trips, onUpdate, onBind, onOpenReview, onOpenInbo
               <div class="checkTop"><span>${md2(e3.date)} ${e3.memo}</span><span class="checkAmt">−₩${formatWon(e3.amount)}</span></div>
               <div class="checkWhy">원래 승인이 명세서에 없는 승인취소예요. 주유소 가승인처럼 승인했다 바로 취소한 것이면 지출에 영향이 없어요. <b>답할 때까지 합계에서 뺐어요.</b></div>
               <div class="chips">
-                <button class="chip sm" onClick=${() => onUpdate(e3.id, { type: "transfer", transferKind: "excluded", excludedBy: "승인취소 (원래 승인 없음)", status: "confirmed" })}>승인만 취소된 것</button>
+                <button class="chip sm" onClick=${() => onUpdate(e3.id, { type: "transfer", transferKind: "excluded", excludedBy: "승인취소 (원래 승인 없음)", catBy: "user", status: "confirmed" })}>승인만 취소된 것</button>
                 <button class="chip sm dash" onClick=${() => onUpdate(e3.id, { catBy: "user", status: "confirmed" })}>환불 맞음</button>
               </div>
             </div>`)}
@@ -6306,12 +6341,18 @@ function restoreSettingsFrom(d3, backup) {
   };
   const trips = [...d3.trips || []];
   let tripsReplaced = 0;
+  const now = Date.now();
+  const stampNow = (t4) => {
+    const { replace, ...x2 } = t4;
+    if (!x2.plan) return { ...x2, updatedAt: now };
+    return { ...x2, updatedAt: now, plan: { ...x2.plan, updatedAt: now, ...x2.plan.marks ? { marksAt: now } : {} } };
+  };
   for (const t4 of backup.trips || []) {
     if (!t4 || !t4.id) continue;
     const i3 = trips.findIndex((x2) => x2.id === t4.id);
-    if (i3 < 0) trips.push(t4);
-    else if ((t4.updatedAt || 0) > (trips[i3].updatedAt || 0)) {
-      trips[i3] = { ...trips[i3], ...t4 };
+    if (i3 < 0) trips.push(t4.replace ? stampNow(t4) : t4);
+    else if (t4.replace || (t4.updatedAt || 0) > (trips[i3].updatedAt || 0)) {
+      trips[i3] = stampNow({ ...trips[i3], ...t4 });
       tripsReplaced++;
     }
   }
@@ -6320,7 +6361,6 @@ function restoreSettingsFrom(d3, backup) {
   const patches = new Map((Array.isArray(backup.entryPatches) ? backup.entryPatches : []).filter((p3) => p3 && p3.id).map((p3) => [p3.id, p3]));
   let patched = 0;
   if (patches.size) {
-    const now = Date.now();
     next.entries = (d3.entries || []).map((e3) => {
       const p3 = patches.get(e3.id);
       if (!p3 || e3.deleted) return e3;
@@ -8809,7 +8849,7 @@ ${out.patched ? "거래 금액은 건드리지 않아요." : "거래 기록은 �
       ${db.settings.lastSyncAt && html4`<div class="hint sm">마지막 동기화 ${new Date(db.settings.lastSyncAt).toLocaleString("ko-KR")}</div>`}
 
       <div class="setDivider">데이터</div>
-      <div class="setStat">버전 <b>v39</b> · 기록 ${db.entries.filter((e3) => !e3.deleted).length}건 · 분류 규칙 ${(db.categoryRules || []).length}개 · 보낼 것 ${db.entries.filter((e3) => e3.dirty).length}건 · 저장 용량 ${(size / 1024).toFixed(0)}KB</div>
+      <div class="setStat">버전 <b>v39a</b> · 기록 ${db.entries.filter((e3) => !e3.deleted).length}건 · 분류 규칙 ${(db.categoryRules || []).length}개 · 보낼 것 ${db.entries.filter((e3) => e3.dirty).length}건 · 저장 용량 ${(size / 1024).toFixed(0)}KB</div>
 
       <div class="acts">
         <button class="btn ghost sm" onClick=${() => fileRef.current && fileRef.current.click()}>가져오기</button>
