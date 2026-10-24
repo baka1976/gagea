@@ -6165,6 +6165,61 @@ function findNotes(now, base2, baseLabel) {
   }
   return notes.slice(0, 8);
 }
+// v40 — 1년 결산: 달마다 수지 · 저축률 · 카테고리 순위
+function yearMonths(all, year) {
+  const out = [];
+  for (let m3 = 1; m3 <= 12; m3++) {
+    const t4 = tally(all, `${year}-${pad2(m3)}-01`, `${year}-${pad2(m3)}-${pad2(lastDay(year, m3))}`);
+    out.push({ m: m3, income: t4.income, expense: t4.expense, net: t4.income - t4.expense, count: t4.count });
+  }
+  return out;
+}
+function YearSummary({ all, year, now }) {
+  const months = T2(() => yearMonths(all, year), [all, year]);
+  const used = months.filter((m3) => m3.count > 0);
+  if (!used.length) return null;
+  const peak = Math.max(1, ...used.map((m3) => Math.abs(m3.net)));
+  const rate = now.income > 0 ? Math.round((now.income - now.expense) / now.income * 100) : null;
+  const avg = Math.round(now.expense / used.length);
+  const plus = used.filter((m3) => m3.net >= 0).length;
+  const best = used.reduce((a3, b3) => b3.net > a3.net ? b3 : a3);
+  const worst = used.reduce((a3, b3) => b3.net < a3.net ? b3 : a3);
+  const cats = Object.entries(now.cats).filter(([, v3]) => v3 > 0).sort((a3, b3) => b3[1] - a3[1]).slice(0, 8);
+  const catPeak = Math.max(1, ...cats.map(([, v3]) => v3));
+  const man = (v3) => `${v3 < 0 ? "−" : "+"}${formatWon(Math.round(Math.abs(v3) / 1e4))}만`;
+  return html3`
+    <div class="yearSum">
+      <div class="yearStats">
+        <div class="yStat"><span>저축률</span><b class=${rate != null && rate < 0 ? "minus" : "plus"}>${rate == null ? "-" : `${rate}%`}</b></div>
+        <div class="yStat"><span>월평균 지출</span><b>₩${formatWon(avg)}</b></div>
+        <div class="yStat"><span>남긴 달</span><b>${plus}<small> / ${used.length}달</small></b></div>
+      </div>
+
+      <div class="repSection">달마다 남은 돈</div>
+      <div class="netChart year">
+        ${months.map((m3, i3) => html3`
+          <div class="netCol" key=${m3.m} style=${`--d:${i3 * 0.04}s`} title=${`${m3.m}월 · 수입 ₩${formatWon(m3.income)} · 지출 ₩${formatWon(m3.expense)}`}>
+            <span class="netVal">${m3.count ? man(m3.net) : ""}</span>
+            <div class="netUp">${m3.net > 0 && html3`<i style=${`height:${(m3.net / peak * 100).toFixed(1)}%`}></i>`}</div>
+            <div class="netDown">${m3.net < 0 && html3`<i style=${`height:${(-m3.net / peak * 100).toFixed(1)}%`}></i>`}</div>
+            <span class="netMonth">${m3.m}</span>
+          </div>`)}
+      </div>
+      <div class="yearBest">
+        <span>가장 많이 남긴 달 <b class="plus">${best.m}월 ${man(best.net)}</b></span>
+        ${worst.net < 0 ? html3`<span>가장 손해 본 달 <b class="minus">${worst.m}월 ${man(worst.net)}</b></span>` : html3`<span>손해 본 달 없음</span>`}
+      </div>
+
+      ${cats.length > 0 && html3`
+        <div class="repSection">1년 동안 많이 쓴 분류</div>
+        ${cats.map(([k3, v3]) => html3`
+          <div class="catBarRow" key=${k3}>
+            <span class="catBarName">${CAT_MAP[k3]?.label || k3}</span>
+            <div class="catBarTrack"><div class="catBarFill" style=${`width:${(v3 / catPeak * 100).toFixed(1)}%;background:${CAT_MAP[k3]?.color || "#8A8A8A"}`}></div></div>
+            <span class="catBarVal">₩${formatWon(v3)}</span>
+          </div>`)}`}
+    </div>`;
+}
 function ReportView({ all, monthStartDay }) {
   const [mode2, setMode] = d2("month");
   const [cursor, setCursor] = d2(() => todayISO().slice(0, 7));
@@ -6193,6 +6248,15 @@ function ReportView({ all, monthStartDay }) {
     L2.push(`수입   ${formatWon(now.income)}원`);
     L2.push(`지출   ${formatWon(now.expense)}원`);
     L2.push(`남은돈 ${formatWon(now.income - now.expense)}원`);
+    if (mode2 === "year") {
+      const ms = yearMonths(all, Number(cursor.slice(0, 4))).filter((m3) => m3.count > 0);
+      if (now.income > 0) L2.push(`저축률 ${Math.round((now.income - now.expense) / now.income * 100)}%`);
+      if (ms.length) {
+        L2.push(`월평균 지출 ${formatWon(Math.round(now.expense / ms.length))}원`);
+        L2.push("");
+        for (const m3 of ms) L2.push(`${String(m3.m).padStart(2)}월  수입 ${formatWon(m3.income)} / 지출 ${formatWon(m3.expense)} / ${m3.net < 0 ? "−" : "+"}${formatWon(Math.abs(m3.net))}`);
+      }
+    }
     L2.push("");
     for (const r3 of rows) L2.push(`${r3.label.padEnd(8)} ${formatWon(r3.now)}원`);
     if (notes.length) {
@@ -6238,6 +6302,8 @@ function ReportView({ all, monthStartDay }) {
             <b>₩${formatWon(Math.abs(left))}</b>
           </div>
         </div>
+
+        ${mode2 === "year" && html3`<${YearSummary} all=${all} year=${Number(cursor.slice(0, 4))} now=${now} />`}
 
         <div class="repSection">항목별${base2 ? html3`<span class="repBase">${baseLabel} 대비</span>` : ""}</div>
         ${rows.map((r3) => html3`
