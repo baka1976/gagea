@@ -492,9 +492,9 @@ function todayISO(offset = 0) {
 }
 function resolveYear(month, day, now = /* @__PURE__ */ new Date()) {
   let y3 = now.getFullYear();
-  const nowM = now.getMonth() + 1;
-  if (month - nowM > 2) y3 -= 1;
-  else if (nowM - month > 9) y3 += 1;
+  // 결제 문자·명세서 날짜는 미래일 수 없다. 일주일 넘게 앞서면 작년으로 본다.
+  // (예전에는 두 달 앞까지 올해로, 12월의 '1/5'는 내년으로 봐서 미래 날짜가 적혔다)
+  if (new Date(y3, month - 1, day) - now > 7 * 864e5) y3 -= 1;
   return toLocalISO(new Date(y3, month - 1, day));
 }
 function formatDateLabel(iso) {
@@ -597,6 +597,7 @@ var CATEGORIES = [
     "엘피지",
     "LPG",
     "충전소",
+    "전기차",
     "SK에너지",
     "GS칼텍스",
     "에쓰오일",
@@ -1141,7 +1142,20 @@ function matchRule(key, rules) {
   }
   return best;
 }
+// 짧은 단어가 다른 낱말 속에 들어 있을 때 걸리지 않게 한다 (v39b)
+// '책임보험'의 책, '전기차'의 기차·전기, 'KT&G'의 KT
+var FALSE_HIT = {
+  "책": /책임/g,
+  "기차": /전기차/g,
+  "전기": /전기차/g,
+  "KT": /KT&G|케이티앤지/gi
+};
 function wordHit(text, low, w3) {
+  const fh = FALSE_HIT[w3];
+  if (fh) {
+    text = text.replace(fh, " ");
+    low = text.toLowerCase();
+  }
   if (/^[A-Za-z0-9+]{1,3}$/.test(w3)) {
     const esc2 = w3.replace(/[+]/g, "\\+");
     return new RegExp(`(^|[^A-Za-z])${esc2}([^A-Za-z]|$)`, "i").test(text);
@@ -1193,7 +1207,8 @@ function classifyIncome(entry, settings) {
   if (/이자/.test(raw) && !/대출/.test(raw)) {
     return { type: "income", category: "income", confidence: 1 };
   }
-  if (st.userName && raw.includes(st.userName)) {
+  const myName = String(st.userName || "").replace(/\s+/g, "");
+  if (myName.length >= 2 && raw.replace(/\s+/g, "").includes(myName)) {
     return { type: "transfer", transferKind: "internal", confidence: 1 };
   }
   const sources = st.incomeSources || [];
@@ -1582,7 +1597,9 @@ function parseStatement(text, opts = {}) {
     const merchant = extractMerchant(body);
     return { date, amount, balance, direction, merchant, body };
   });
-  const chrono = [...parsed].reverse();
+  // 보통 명세서는 최신 거래가 위에 있지만, 오래된 거래가 위인 것도 있다. 날짜로 순서를 판단한다.
+  const oldestFirst = parsed[0].date < parsed[parsed.length - 1].date;
+  const chrono = oldestFirst ? [...parsed] : [...parsed].reverse();
   for (let i3 = 1; i3 < chrono.length; i3++) {
     const prev = chrono[i3 - 1], curr = chrono[i3];
     if (prev.balance == null || curr.balance == null) continue;
@@ -1706,6 +1723,9 @@ function preferred(a3, b3) {
 function reconcile(incoming, existing) {
   const added = [], merged = [], review = [];
   const pool = [...existing];
+  // 기존 기록 하나에는 새 줄 하나만 짝짓는다. 같은 날 같은 곳에서 같은 금액을 두 번 쓰면
+  // 두 줄이 한 기록에 함께 합쳐져 한 건이 사라지던 문제 (v39b)
+  const taken = /* @__PURE__ */ new Set();
   for (const inc of incoming) {
     if (inc.transferKind === "fxTopup" || inc.category === "family") {
       added.push(inc);
@@ -1714,15 +1734,17 @@ function reconcile(incoming, existing) {
     }
     let best = null;
     for (const ex of pool) {
-      if (ex.deleted) continue;
+      if (ex.deleted || taken.has(ex)) continue;
       if (inc.sourceHash && ex.sourceHash && inc.sourceHash !== ex.sourceHash && String(inc.sourceHash).split("|")[0] === String(ex.sourceHash).split("|")[0]) continue;
       const r3 = matchScore(inc, ex);
       if (!r3 || !r3.score) continue;
       if (!best || r3.score > best.score) best = { ...r3, target: ex };
     }
     if (best && best.score >= 80) {
+      taken.add(best.target);
       merged.push({ incoming: inc, target: best.target, ...best });
     } else if (best && best.score >= 50) {
+      taken.add(best.target);
       review.push({ incoming: inc, target: best.target, ...best });
       pool.push(inc);
     } else {
@@ -2860,7 +2882,10 @@ function detectColumns(rows) {
   };
 }
 var num = (s3) => {
-  const v3 = parseInt(String(s3 || "").replace(/[^\d-]/g, ""), 10);
+  // 소수점을 지우면 '1,234.50'이 123450이 된다. 점이 하나일 때만 소수점으로 보고 반올림한다.
+  let t4 = String(s3 == null ? "" : s3).replace(/[^\d.\-]/g, "");
+  if ((t4.match(/\./g) || []).length > 1) t4 = t4.replace(/\./g, "");
+  const v3 = Math.round(parseFloat(t4));
   return isNaN(v3) ? 0 : v3;
 };
 function normalizeDate(s3) {
@@ -6410,19 +6435,34 @@ function unpackEntry(e3) {
   if (o3.counterpartyRaw === void 0) o3.counterpartyRaw = o3.memo;
   return o3;
 }
+/**
+ * 저장된 데이터를 읽지 못했을 때 빈 장부를 그대로 저장하면 남아 있던 원본까지 지워진다.
+ * 원본을 따로 보관하고, 보관도 못 했으면 이번 실행에서는 저장하지 않는다. (v39b)
+ */
+var DB_BROKEN_KEY = "ledger:db:broken";
+var saveBlocked = false;
 function loadDB() {
+  let raw = null;
   try {
-    const raw = localStorage.getItem(DB_KEY);
+    raw = localStorage.getItem(DB_KEY);
     if (!raw) return { ...EMPTY_DB };
     const parsed = JSON.parse(raw);
     const entries = (parsed.entries || []).map(unpackEntry);
     return { ...EMPTY_DB, ...parsed, entries, settings: { ...EMPTY_DB.settings, ...parsed.settings || {} } };
   } catch (e3) {
     console.warn("저장된 데이터를 읽지 못했습니다", e3);
+    if (raw) {
+      try {
+        localStorage.setItem(DB_BROKEN_KEY, raw);
+      } catch (e22) {
+        saveBlocked = true;
+      }
+    }
     return { ...EMPTY_DB };
   }
 }
 function saveDB(db) {
+  if (saveBlocked) return { ok: false, blocked: true };
   try {
     const s3 = JSON.stringify({ ...db, entries: (db.entries || []).map(packEntry) });
     localStorage.setItem(DB_KEY, s3);
@@ -6867,7 +6907,9 @@ function App() {
   }, [db]);
   h2(() => {
     const r3 = saveDB(db);
-    if (!r3.ok) {
+    if (r3.blocked) {
+      setToast("저장된 장부를 읽지 못해 원본을 지키려고 저장을 멈췄어요. 앱을 닫았다 다시 열어 주세요.");
+    } else if (!r3.ok) {
       setToast("저장 공간이 찼어요 — 방금 것이 저장되지 않았습니다. 설정에서 백업을 받고 오래된 기록을 정리해 주세요.");
     } else if (r3.size > 35e5) {
       setToast("저장 공간이 거의 찼어요. 설정에서 백업을 받아두세요.");
@@ -8849,7 +8891,7 @@ ${out.patched ? "거래 금액은 건드리지 않아요." : "거래 기록은 �
       ${db.settings.lastSyncAt && html4`<div class="hint sm">마지막 동기화 ${new Date(db.settings.lastSyncAt).toLocaleString("ko-KR")}</div>`}
 
       <div class="setDivider">데이터</div>
-      <div class="setStat">버전 <b>v39a</b> · 기록 ${db.entries.filter((e3) => !e3.deleted).length}건 · 분류 규칙 ${(db.categoryRules || []).length}개 · 보낼 것 ${db.entries.filter((e3) => e3.dirty).length}건 · 저장 용량 ${(size / 1024).toFixed(0)}KB</div>
+      <div class="setStat">버전 <b>v39b</b> · 기록 ${db.entries.filter((e3) => !e3.deleted).length}건 · 분류 규칙 ${(db.categoryRules || []).length}개 · 보낼 것 ${db.entries.filter((e3) => e3.dirty).length}건 · 저장 용량 ${(size / 1024).toFixed(0)}KB</div>
 
       <div class="acts">
         <button class="btn ghost sm" onClick=${() => fileRef.current && fileRef.current.click()}>가져오기</button>
