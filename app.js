@@ -6909,42 +6909,131 @@ function paceSeries(entries, start, end) {
   let run = 0;
   return daily.map((v3) => run += v3);
 }
+function shiftCursor(cursor, d3) {
+  const [y3, m3] = cursor.split("-").map(Number);
+  const nd = new Date(y3, m3 - 1 + d3, 1);
+  return `${nd.getFullYear()}-${String(nd.getMonth() + 1).padStart(2, "0")}`;
+}
+// 한 달의 수입·지출 (합계 기준과 같다)
+function monthFlow(all, cursor, startDay) {
+  const r3 = periodRange(cursor, startDay);
+  let income = 0, spend = 0;
+  for (const e3 of all) {
+    if (e3.date < r3.start || e3.date > r3.end) continue;
+    if (e3.type === "income") income += e3.amount;
+    else spend += paceSpend(e3);
+  }
+  return { cursor, ...r3, income, spend, net: income - spend };
+}
+// 이번 달 기준 수입: 이번 달 수입이 아직 없으면 지난달 수입으로 본다
+function incomeBase(all, cursor, startDay) {
+  const cur = monthFlow(all, cursor, startDay);
+  if (cur.income > 0) return { base: cur.income, guessed: false, cur };
+  const prev = monthFlow(all, shiftCursor(cursor, -1), startDay);
+  return { base: prev.income, guessed: prev.income > 0, cur };
+}
+// 수입 대비 지출 막대 — 남은 돈 / 넘은 돈
+function BalanceBar({ all, cursor, startDay }) {
+  const { base, guessed, cur } = incomeBase(all, cursor, startDay);
+  if (!base) return null;
+  const used = cur.spend / base;
+  const over = cur.spend > base;
+  const left = base - cur.spend;
+  const w3 = Math.min(100, used * 100);
+  return html4`
+    <div class=${"balance" + (over ? " over" : "")} key=${cursor}>
+      <div class="balTrack"><i class="balFill" style=${`width:${w3.toFixed(1)}%`}></i>${over && html4`<i class="balOver" style=${`width:${Math.min(100, (used - 1) * 100).toFixed(1)}%`}></i>`}</div>
+      <div class="balText">
+        <span>${guessed ? "지난달 수입 기준 " : "수입의 "}<b>${Math.round(used * 100)}%</b> 썼어요</span>
+        <span class="balLeft">${over ? html4`넘은 돈 <b>₩${formatWon2(-left)}</b>` : html4`남은 돈 <b>₩${formatWon2(left)}</b>`}</span>
+      </div>
+    </div>`;
+}
 function PaceLine({ all, cursor, startDay }) {
   const cur = periodRange(cursor, startDay);
-  const [y3, m3] = cursor.split("-").map(Number);
-  const pd = new Date(y3, m3 - 2, 1);
-  const prevCursor = `${pd.getFullYear()}-${String(pd.getMonth() + 1).padStart(2, "0")}`;
-  const prev = periodRange(prevCursor, startDay);
+  const prev = periodRange(shiftCursor(cursor, -1), startDay);
   const now = paceSeries(all, cur.start, cur.end);
   const before = paceSeries(all, prev.start, prev.end);
+  const { base } = incomeBase(all, cursor, startDay);
   const today = todayISO2();
   const live = today >= cur.start && today <= cur.end;
   const upto = live ? Math.round((/* @__PURE__ */ new Date(today + "T00:00:00") - /* @__PURE__ */ new Date(cur.start + "T00:00:00")) / 864e5) : now.length - 1;
   const shown = now.slice(0, upto + 1);
   const hasBefore = before[before.length - 1] > 0;
-  const max = Math.max(1, ...shown, ...hasBefore ? before : []);
-  const W = 300, H = 64, n3 = Math.max(now.length, before.length) - 1 || 1;
-  const pt = (v3, i3) => `${(i3 / n3 * W).toFixed(1)},${(H - 4 - v3 / max * (H - 10)).toFixed(1)}`;
-  const line = (arr) => arr.map((v3, i3) => (i3 ? "L" : "M") + pt(v3, i3)).join(" ");
   if (!shown.length || shown[shown.length - 1] <= 0 && !hasBefore) return null;
+  const max = Math.max(1, ...shown, ...hasBefore ? before : [], base * 1.08);
+  const W = 300, H = 64, n3 = Math.max(now.length, before.length) - 1 || 1;
+  const yOf = (v3) => H - 4 - v3 / max * (H - 10);
+  const pt = (v3, i3) => `${(i3 / n3 * W).toFixed(1)},${yOf(v3).toFixed(1)}`;
+  const line = (arr) => arr.map((v3, i3) => (i3 ? "L" : "M") + pt(v3, i3)).join(" ");
   const nowV = shown[shown.length - 1], beforeV = before[Math.min(upto, before.length - 1)] || 0;
   const diff = nowV - beforeV;
   const lastX = (upto / n3 * W).toFixed(1);
-  const lastY = (H - 4 - nowV / max * (H - 10)).toFixed(1);
+  const ty = base > 0 ? yOf(base) : -20;
+  const over = base > 0 && nowV > base;
   return html4`
     <div class="pace" key=${cursor}>
-      <svg class="paceSvg" viewBox=${`0 0 ${W} ${H}`} preserveAspectRatio="none" aria-hidden="true">
-        <defs><linearGradient id="paceFill" x1="0" x2="0" y1="0" y2="1">
-          <stop offset="0" stop-color="var(--seal)" stop-opacity="0.22" /><stop offset="1" stop-color="var(--seal)" stop-opacity="0" />
-        </linearGradient></defs>
-        ${hasBefore && html4`<path class="paceBefore" d=${line(before)} />`}
-        <path class="paceArea" d=${`${line(shown)} L${lastX},${H} L0,${H} Z`} fill="url(#paceFill)" />
-        <path class="paceNow" d=${line(shown)} />
-        <circle class="paceDot" cx=${lastX} cy=${lastY} r="3.2" />
-      </svg>
+      <div class="paceBox">
+        <svg class="paceSvg" viewBox=${`0 0 ${W} ${H}`} preserveAspectRatio="none" aria-hidden="true">
+          <defs>
+            <linearGradient id="paceFill" x1="0" x2="0" y1="0" y2="1">
+              <stop offset="0" stop-color="var(--safe)" stop-opacity="0.2" /><stop offset="1" stop-color="var(--safe)" stop-opacity="0" />
+            </linearGradient>
+            <clipPath id="paceSafeClip"><rect x="-5" y=${ty} width=${W + 10} height=${H - ty + 10} /></clipPath>
+            <clipPath id="paceOverClip"><rect x="-5" y="-10" width=${W + 10} height=${ty + 10} /></clipPath>
+          </defs>
+          ${over && html4`<rect class="paceOverZone" x="0" y="0" width=${W} height=${Math.max(0, ty)} />`}
+          ${hasBefore && html4`<path class="paceBefore" d=${line(before)} />`}
+          <path class="paceArea" d=${`${line(shown)} L${lastX},${H} L0,${H} Z`} fill="url(#paceFill)" />
+          ${base > 0 && html4`<line class="paceIncome" x1="0" x2=${W} y1=${ty} y2=${ty} />`}
+          <path class="paceNow safe" d=${line(shown)} clip-path="url(#paceSafeClip)" />
+          ${base > 0 && html4`<path class="paceNow over" d=${line(shown)} clip-path="url(#paceOverClip)" />`}
+          <circle class=${"paceDot" + (over ? " over" : "")} cx=${lastX} cy=${yOf(nowV).toFixed(1)} r="3.2" />
+        </svg>
+        ${base > 0 && html4`<span class="paceIncomeLabel" style=${`top:${(ty / H * 100).toFixed(1)}%`}>수입 ₩${formatWon2(base)}</span>`}
+      </div>
       <div class="paceNote">
-        ${hasBefore ? html4`${live ? "지난달 이맘때보다" : "지난달보다"} <b class=${diff > 0 ? "exp" : "inc"}>₩${formatWon2(Math.abs(diff))} ${diff > 0 ? "더" : "덜"}</b> 썼어요` : "이번 달 지출 흐름"}
+        ${hasBefore ? html4`${live ? "지난달 이맘때보다" : "지난달보다"} <b class=${diff > 0 ? "exp" : "safe"}>₩${formatWon2(Math.abs(diff))} ${diff > 0 ? "더" : "덜"}</b> 썼어요` : "이번 달 지출 흐름"}
         <span class="paceLegend">${hasBefore && html4`<i class="lgBefore"></i>지난달`}<i class="lgNow"></i>이번 달</span>
+      </div>
+    </div>`;
+}
+// 최근 6개월 수지 — 넓은 화면에서만
+function NetMonths({ all, cursor, startDay }) {
+  const months = [];
+  for (let i3 = 5; i3 >= 0; i3--) months.push(monthFlow(all, shiftCursor(cursor, -i3), startDay));
+  if (!months.some((m3) => m3.income || m3.spend)) return null;
+  const peak = Math.max(1, ...months.map((m3) => Math.abs(m3.net)));
+  const total = months.reduce((a3, m3) => a3 + m3.net, 0);
+  const man = (v3) => `${v3 < 0 ? "−" : "+"}${formatWon2(Math.round(Math.abs(v3) / 1e4))}만`;
+  return html4`
+    <div class="netCard">
+      <div class="netHead">
+        <span>최근 6개월 수지</span>
+        <span class=${"netTotal " + (total < 0 ? "minus" : "plus")}>${total < 0 ? "손해" : "남음"} ₩${formatWon2(Math.abs(total))}</span>
+      </div>
+      <div class="netChart">
+        ${months.map((m3, i3) => {
+    const h3 = Math.abs(m3.net) / peak * 100;
+    const mm = +m3.cursor.slice(5);
+    return html4`
+          <div class=${"netCol" + (m3.cursor === cursor ? " on" : "")} key=${m3.cursor} style=${`--d:${i3 * 0.06}s`}
+            title=${`${mm}월 · 수입 ₩${formatWon2(m3.income)} · 지출 ₩${formatWon2(m3.spend)}`}>
+            <span class="netVal">${m3.income || m3.spend ? man(m3.net) : ""}</span>
+            <div class="netUp">${m3.net > 0 && html4`<i style=${`height:${h3.toFixed(1)}%`}></i>`}</div>
+            <div class="netDown">${m3.net < 0 && html4`<i style=${`height:${h3.toFixed(1)}%`}></i>`}</div>
+            <span class="netMonth">${mm}월</span>
+          </div>`;
+  })}
+      </div>
+      <div class="netRows">
+        ${months.slice().reverse().slice(0, 3).map((m3) => html4`
+          <div class="netRow" key=${m3.cursor}>
+            <span>${+m3.cursor.slice(5)}월</span>
+            <span class="netIn">수입 ₩${formatWon2(m3.income)}</span>
+            <span class="netOut">지출 ₩${formatWon2(m3.spend)}</span>
+            <b class=${m3.net < 0 ? "minus" : "plus"}>${m3.net < 0 ? "−" : "+"}₩${formatWon2(Math.abs(m3.net))}</b>
+          </div>`)}
       </div>
     </div>`;
 }
@@ -7736,6 +7825,7 @@ function App() {
           <button class="btn danger sm" onClick=${bulkDelete}>삭제</button>
         </div>`}
     </div>`;
+  const incBase = T2(() => incomeBase(forSum, cursor, db.settings.monthStartDay).base, [forSum, cursor, db.settings.monthStartDay]);
   const monthHead = html4`
           <div class="monthBar">
             <button class="nav" onClick=${() => shiftMonth(-1)} aria-label="이전 달"><${IcoLeft} size=${18} /></button>
@@ -7763,10 +7853,11 @@ function App() {
                   <span class="axisLabel">${label}</span>
                   <span class="axisVal">₩${formatWon2(v3)}</span>
                 </div>`)}
-            <div class="axis total">
+            <div class=${"axis total" + (incBase > 0 ? axes.expense > incBase ? " over" : " safe" : "")}>
               <span class="axisLabel">지출 합계</span>
               <span class="axisVal"><${CountUp} value=${axes.expense} /></span>
             </div>
+            <${BalanceBar} all=${forSum} cursor=${cursor} startDay=${db.settings.monthStartDay} />
             <${PaceLine} all=${forSum} cursor=${cursor} startDay=${db.settings.monthStartDay} />
             ${held > 0 && html4`<div class="axisHeld">확인 안 된 ${held}건은 합계에 아직 안 넣었어요</div>`}
             ${(axes.welfare > 0 || welfare.used > 0) && html4`
@@ -7799,7 +7890,7 @@ function App() {
                 <span class="axisVal">₩${formatWon2(axes.income)}</span>
               </div>`}
           </div>`}
-          ${!showChart && html4`<div class="wideOnly"><${StatsView} entries=${inRangeSum} all=${forSum} /></div>`}`;
+          ${!showChart && html4`<div class="wideOnly"><${NetMonths} all=${forSum} cursor=${cursor} startDay=${db.settings.monthStartDay} /><${StatsView} entries=${inRangeSum} all=${forSum} /></div>`}`;
   return html4`
     <div class="app">
       <div class="side">
