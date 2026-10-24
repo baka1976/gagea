@@ -6872,6 +6872,82 @@ function DateGroups({ list, pairs, ...rest }) {
       ${rowsOf(items).map((r3) => r3.e ? html4`<${EntryRow} key=${r3.e.id} entry=${r3.e} ...${rest} checked=${rest.selectedIds ? rest.selectedIds.includes(r3.e.id) : false} />` : html4`<${PairRow} key=${"pair-" + r3.pay.id} pay=${r3.pay} cancel=${r3.cancel} rest=${rest} />`)}
     </div>`)}`;
 }
+// v40 — 움직이는 요약: 합계 숫자 올라가기 · 이번 달 지출 흐름
+var reduceMotion = () => typeof window !== "undefined" && window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+function CountUp({ value, ms = 750 }) {
+  const [shown, setShown] = d2(reduceMotion() ? value : 0);
+  const fromRef = A2(0);
+  h2(() => {
+    if (reduceMotion()) {
+      setShown(value);
+      return;
+    }
+    const from = fromRef.current, t0 = performance.now();
+    let raf = 0;
+    const step = (t4) => {
+      const k3 = Math.min(1, (t4 - t0) / ms);
+      const v3 = Math.round(from + (value - from) * (1 - Math.pow(1 - k3, 3)));
+      setShown(v3);
+      fromRef.current = v3;
+      if (k3 < 1) raf = requestAnimationFrame(step);
+    };
+    raf = requestAnimationFrame(step);
+    return () => cancelAnimationFrame(raf);
+  }, [value]);
+  return html4`₩${formatWon2(shown)}`;
+}
+// 합계에 들어가는 지출만 (axes.expense와 같은 기준)
+var paceSpend = (e3) => e3.type === "expense" && e3.transferKind !== "welfare" && (!e3.transferKind || e3.transferKind === "external") ? e3.isRefund ? -e3.amount : e3.amount : 0;
+function paceSeries(entries, start, end) {
+  const days = Math.round((/* @__PURE__ */ new Date(end + "T00:00:00") - /* @__PURE__ */ new Date(start + "T00:00:00")) / 864e5) + 1;
+  const daily = new Array(days).fill(0);
+  for (const e3 of entries) {
+    if (e3.date < start || e3.date > end) continue;
+    const i3 = Math.round((/* @__PURE__ */ new Date(e3.date + "T00:00:00") - /* @__PURE__ */ new Date(start + "T00:00:00")) / 864e5);
+    daily[i3] += paceSpend(e3);
+  }
+  let run = 0;
+  return daily.map((v3) => run += v3);
+}
+function PaceLine({ all, cursor, startDay }) {
+  const cur = periodRange(cursor, startDay);
+  const [y3, m3] = cursor.split("-").map(Number);
+  const pd = new Date(y3, m3 - 2, 1);
+  const prevCursor = `${pd.getFullYear()}-${String(pd.getMonth() + 1).padStart(2, "0")}`;
+  const prev = periodRange(prevCursor, startDay);
+  const now = paceSeries(all, cur.start, cur.end);
+  const before = paceSeries(all, prev.start, prev.end);
+  const today = todayISO2();
+  const live = today >= cur.start && today <= cur.end;
+  const upto = live ? Math.round((/* @__PURE__ */ new Date(today + "T00:00:00") - /* @__PURE__ */ new Date(cur.start + "T00:00:00")) / 864e5) : now.length - 1;
+  const shown = now.slice(0, upto + 1);
+  const hasBefore = before[before.length - 1] > 0;
+  const max = Math.max(1, ...shown, ...hasBefore ? before : []);
+  const W = 300, H = 64, n3 = Math.max(now.length, before.length) - 1 || 1;
+  const pt = (v3, i3) => `${(i3 / n3 * W).toFixed(1)},${(H - 4 - v3 / max * (H - 10)).toFixed(1)}`;
+  const line = (arr) => arr.map((v3, i3) => (i3 ? "L" : "M") + pt(v3, i3)).join(" ");
+  if (!shown.length || shown[shown.length - 1] <= 0 && !hasBefore) return null;
+  const nowV = shown[shown.length - 1], beforeV = before[Math.min(upto, before.length - 1)] || 0;
+  const diff = nowV - beforeV;
+  const lastX = (upto / n3 * W).toFixed(1);
+  const lastY = (H - 4 - nowV / max * (H - 10)).toFixed(1);
+  return html4`
+    <div class="pace" key=${cursor}>
+      <svg class="paceSvg" viewBox=${`0 0 ${W} ${H}`} preserveAspectRatio="none" aria-hidden="true">
+        <defs><linearGradient id="paceFill" x1="0" x2="0" y1="0" y2="1">
+          <stop offset="0" stop-color="var(--seal)" stop-opacity="0.22" /><stop offset="1" stop-color="var(--seal)" stop-opacity="0" />
+        </linearGradient></defs>
+        ${hasBefore && html4`<path class="paceBefore" d=${line(before)} />`}
+        <path class="paceArea" d=${`${line(shown)} L${lastX},${H} L0,${H} Z`} fill="url(#paceFill)" />
+        <path class="paceNow" d=${line(shown)} />
+        <circle class="paceDot" cx=${lastX} cy=${lastY} r="3.2" />
+      </svg>
+      <div class="paceNote">
+        ${hasBefore ? html4`${live ? "지난달 이맘때보다" : "지난달보다"} <b class=${diff > 0 ? "exp" : "inc"}>₩${formatWon2(Math.abs(diff))} ${diff > 0 ? "더" : "덜"}</b> 썼어요` : "이번 달 지출 흐름"}
+        <span class="paceLegend">${hasBefore && html4`<i class="lgBefore"></i>지난달`}<i class="lgNow"></i>이번 달</span>
+      </div>
+    </div>`;
+}
 function App() {
   const [db, setDb] = d2(loadDB);
   const [paste, setPaste] = d2("");
@@ -7579,7 +7655,9 @@ function App() {
       return String(e3.memo ?? "").toLowerCase().includes(q3) || cat.toLowerCase().includes(q3) || String(e3.amount).includes(q3) || qNum.length >= 2 && String(e3.amount).includes(qNum) || qDate && String(e3.date || "").includes(qDate) || tn.toLowerCase().includes(q3) || cn.toLowerCase().includes(q3) || String(e3.rawText ?? "").toLowerCase().includes(q3) || String(e3.counterpartyRaw ?? "").toLowerCase().includes(q3) || String(e3.date ?? "").includes(q3);
     }).sort((a3, b3) => a3.date < b3.date ? 1 : a3.date > b3.date ? -1 : b3.createdAt - a3.createdAt);
   }, [live, query, db.trips, db.vehicles]);
+  const [slideDir, setSlideDir] = d2(0);
   const shiftMonth = (d3) => {
+    setSlideDir(d3);
     const [y3, m3] = cursor.split("-").map(Number);
     const nd = new Date(y3, m3 - 1 + d3, 1);
     setCursor(`${nd.getFullYear()}-${String(nd.getMonth() + 1).padStart(2, "0")}`);
@@ -7672,7 +7750,7 @@ function App() {
           </div>
 
           ${showChart === "report" ? html4`<${ReportView} all=${forSum} monthStartDay=${db.settings.monthStartDay} />` : showChart === "chart" ? html4`<${StatsView} entries=${inRangeSum} all=${forSum} />` : html4`
-          <div class="axes">
+          <div class=${"axes" + (slideDir ? slideDir > 0 ? " fromR" : " fromL" : "")} key=${cursor}>
             ${[
     ["변동비", axes.variable],
     ["고정비", axes.fixed],
@@ -7687,8 +7765,9 @@ function App() {
                 </div>`)}
             <div class="axis total">
               <span class="axisLabel">지출 합계</span>
-              <span class="axisVal">₩${formatWon2(axes.expense)}</span>
+              <span class="axisVal"><${CountUp} value=${axes.expense} /></span>
             </div>
+            <${PaceLine} all=${forSum} cursor=${cursor} startDay=${db.settings.monthStartDay} />
             ${held > 0 && html4`<div class="axisHeld">확인 안 된 ${held}건은 합계에 아직 안 넣었어요</div>`}
             ${(axes.welfare > 0 || welfare.used > 0) && html4`
               <div class="axis welfare">
@@ -7719,9 +7798,11 @@ function App() {
                 <span class="axisLabel">수입</span>
                 <span class="axisVal">₩${formatWon2(axes.income)}</span>
               </div>`}
-          </div>`}`;
+          </div>`}
+          ${!showChart && html4`<div class="wideOnly"><${StatsView} entries=${inRangeSum} all=${forSum} /></div>`}`;
   return html4`
     <div class="app">
+      <div class="side">
       <header class="head">
         <button class="gear" onClick=${() => setShowSettings((v3) => !v3)} aria-label="설정"><${IcoGear} size=${17} /></button>
         ${db.settings.sheetUrl && html4`
@@ -7948,7 +8029,9 @@ function App() {
             ${inbox.length > 4 && html4`<div class="inboxMore">외 ${inbox.length - 4}건</div>`}
           </div>`}
         </div>`}
+      </div>
 
+      <div class="main">
       ${query.trim() ? html4`<div class="results">
             <div class="resultHead">"${query.trim()}" 검색 결과 ${searchHits.length}건</div>
             ${searchHits.length === 0 ? html4`<div class="empty">일치하는 내역이 없어요.</div>` : html4`
@@ -8012,6 +8095,7 @@ function App() {
             mileage=${mileage} setMileage=${setMileage} mileageDate=${mileageDate} setMileageDate=${setMileageDate}
             maintEdit=${maintEdit} setMaintEdit=${setMaintEdit} patch=${patch} addVehicle=${addVehicle}
             latestMileage=${latestMileage} rowProps=${rowProps} />`}
+      </div>
 
       ${bulk && html4`
         <div class="bulkBar" role="status">
@@ -8891,7 +8975,7 @@ ${out.patched ? "거래 금액은 건드리지 않아요." : "거래 기록은 �
       ${db.settings.lastSyncAt && html4`<div class="hint sm">마지막 동기화 ${new Date(db.settings.lastSyncAt).toLocaleString("ko-KR")}</div>`}
 
       <div class="setDivider">데이터</div>
-      <div class="setStat">버전 <b>v39b</b> · 기록 ${db.entries.filter((e3) => !e3.deleted).length}건 · 분류 규칙 ${(db.categoryRules || []).length}개 · 보낼 것 ${db.entries.filter((e3) => e3.dirty).length}건 · 저장 용량 ${(size / 1024).toFixed(0)}KB</div>
+      <div class="setStat">버전 <b>v40</b> · 기록 ${db.entries.filter((e3) => !e3.deleted).length}건 · 분류 규칙 ${(db.categoryRules || []).length}개 · 보낼 것 ${db.entries.filter((e3) => e3.dirty).length}건 · 저장 용량 ${(size / 1024).toFixed(0)}KB</div>
 
       <div class="acts">
         <button class="btn ghost sm" onClick=${() => fileRef.current && fileRef.current.click()}>가져오기</button>
